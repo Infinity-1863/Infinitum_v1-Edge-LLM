@@ -74,6 +74,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\chat.ps1 `
   -Message "привет"
 ```
 
+Measure a PC baseline or universal page-prefetch profile:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bench-pc.ps1 `
+  -PackageDir .\package `
+  -ServerBin C:\llama.cpp\build\bin\Release\llama-server.exe `
+  -Profile page-prefetch
+```
+
 ## Notes
 
 - `split-model.ps1` does not convert Hugging Face tensors into GGUF. Use your
@@ -86,6 +95,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\chat.ps1 `
   Android `llama-server` bundle into the phone package `bin/` directory.
 - For GPT-OSS chat, use `chat.ps1`. It sends the request as UTF-8 and uses the
   model's Harmony-style tokens instead of the generic ChatML template.
+- `bench-pc.ps1` compares the plain launch path with a universal page-prefetch
+  profile. It asks the runtime to warm one routed expert for the next layer
+  through the OS page cache, without copying the whole expert pack into process
+  RAM. Increase `-PrefetchMaxExperts` only when disk latency dominates.
 - Keep raw model weights, logs, and device dumps out of public commits unless
   their licenses explicitly allow redistribution.
 

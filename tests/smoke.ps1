@@ -27,6 +27,7 @@ $requiredFiles = @(
   "README.md",
   "scripts\split-model.ps1",
   "scripts\build-expert-pack.ps1",
+  "scripts\bench-pc.ps1",
   "scripts\run-pc.ps1",
   "scripts\run-phone.ps1",
   "scripts\chat.ps1",
@@ -99,6 +100,14 @@ try {
   }
   Assert-Contains $pcPlanFromConflict $PackageDir "PC dry run should resolve relative manifest paths under PackageDir, not CWD"
   Assert-True (-not $pcPlanFromConflict.Contains($conflictRoot)) "PC dry run should not pick conflicting files from CWD"
+
+  $benchSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\bench-pc.ps1") -Raw
+  Assert-Contains $benchSource "page-prefetch" "PC bench should expose universal page-prefetch profile"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH" "PC bench should enable GGML pack page prefetch"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS" "PC bench should bound page prefetch pressure"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_TOUCH_FALLBACK" "PC bench should clear opt-in touch fallback"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR" "PC bench should keep learned prediction available for streaming diagnostics"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_GPU_GLOBAL_SLOTS" "PC bench should support bounded global GPU expert slots"
 
   $phonePlan = & (Join-Path $RepoRoot "scripts\run-phone.ps1") `
     -PackageDir $PackageDir `
