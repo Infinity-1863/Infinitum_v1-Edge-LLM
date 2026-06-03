@@ -1,9 +1,10 @@
 # Generated packages and local model artifacts
-package/
-packages/
-artifacts/
-models/
-Models/
+/build/
+/package/
+/packages/
+/artifacts/
+/models/
+/Models/
 *.gguf
 *.safetensors
 *.bin
@@ -18,7 +19,9 @@ Models/
 *.cmd
 *.tmp
 *.cache
-device-dumps/
+/device-dumps/
+vendor/llama.cpp/build*/
+vendor/llama.cpp/**/build*/
 
 # Python / PowerShell / editor noise
 __pycache__/

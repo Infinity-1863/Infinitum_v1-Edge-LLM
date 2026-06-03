@@ -25,9 +25,19 @@ function Assert-Contains {
 
 $requiredFiles = @(
   "README.md",
+  "docs\INDEX.md",
+  "docs\PERFORMANCE.md",
+  "docs\RUNTIME.md",
+  "vendor\llama.cpp\CMakeLists.txt",
+  "vendor\llama.cpp\src\llama-infinitum-moe.cpp",
+  "vendor\llama.cpp\src\models\openai-moe.cpp",
   "scripts\split-model.ps1",
   "scripts\build-expert-pack.ps1",
+  "scripts\build-runtime-pc.ps1",
+  "scripts\build-runtime-android.ps1",
   "scripts\bench-pc.ps1",
+  "scripts\bench-phone.ps1",
+  "scripts\sweep-phone-full.ps1",
   "scripts\run-pc.ps1",
   "scripts\run-phone.ps1",
   "scripts\chat.ps1",
@@ -108,6 +118,27 @@ try {
   Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_TOUCH_FALLBACK" "PC bench should clear opt-in touch fallback"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR" "PC bench should keep learned prediction available for streaming diagnostics"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_GPU_GLOBAL_SLOTS" "PC bench should support bounded global GPU expert slots"
+
+  $runtimeSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\src\llama-infinitum-moe.cpp") -Raw
+  Assert-Contains $runtimeSource "LLAMA_INFINITUM_SELECTIVE_MOE" "bundled runtime should contain external expert support"
+  Assert-Contains $runtimeSource "LLAMA_INFINITUM_EXPERT_ROW_THREADS" "bundled runtime should contain full-model row threading knob"
+
+  $phoneBenchPlan = & (Join-Path $RepoRoot "scripts\bench-phone.ps1") `
+    -DeviceDir "/data/local/tmp/infinitum-edge-smoke" `
+    -Profile page-prefetch `
+    -PcPort 18110 `
+    -PhonePort 8080 `
+    -DryRun 2>&1 | Out-String
+  Assert-Contains $phoneBenchPlan "LLAMA_INFINITUM_GGML_PACK_PREFETCH=1" "phone bench should enable GGML pack page prefetch"
+  Assert-Contains $phoneBenchPlan "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS=1" "phone bench should bound page prefetch pressure"
+  Assert-Contains $phoneBenchPlan "POST http://127.0.0.1:18110/completion" "phone bench should describe the forwarded completion endpoint"
+  $phoneBenchSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\bench-phone.ps1") -Raw
+  Assert-Contains $phoneBenchSource "LLAMA_INFINITUM_PROFILE" "phone bench should preserve profile env support through ExtraEnv"
+  Assert-Contains $phoneBenchSource "compute_ms_sum" "phone bench should aggregate runtime profile compute time"
+  $phoneSweepSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\sweep-phone-full.ps1") -Raw
+  Assert-Contains $phoneSweepSource "LLAMA_INFINITUM_EXPERT_BACKEND=simd" "phone sweep should test full-model SIMD backend"
+  Assert-Contains $phoneSweepSource "PrefetchMaxExperts = 4" "phone sweep should test wider full-model prefetch"
+  Assert-True (-not $phoneSweepSource.Contains("LLAMA_INFINITUM_EXPERT_TOP_K")) "phone sweep must not reduce selected experts"
 
   $phonePlan = & (Join-Path $RepoRoot "scripts\run-phone.ps1") `
     -PackageDir $PackageDir `
