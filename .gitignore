@@ -1,0 +1,28 @@
+# Generated packages and local model artifacts
+package/
+packages/
+artifacts/
+models/
+Models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Logs, caches, local device dumps
+*.log
+*.pid
+*.exit
+*.cmd
+*.tmp
+*.cache
+device-dumps/
+
+# Python / PowerShell / editor noise
+__pycache__/
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
