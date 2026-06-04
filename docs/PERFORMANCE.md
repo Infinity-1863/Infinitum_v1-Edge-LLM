@@ -37,6 +37,15 @@ Phone package: `/data/local/tmp/infinitum-edge-gpt-oss-20b`
 | before | baseline | 10.618 | 8.995 | `20260603-202609-baseline.result.json` |
 | after | page-prefetch | 10.803 | 8.534 | `20260603-202742-page-prefetch.result.json` |
 
+### GPT-OSS 120B Laptop
+
+| State | Profile | Prompt tok/s | Decode tok/s | Notes |
+| --- | --- | ---: | ---: | --- |
+| baseline | graph | 0.9 | 2.4 | `baseline_120b_laptop_cpu_20260604.result.json` |
+| current | graph | 2.9 | 1.9 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
+| before | pack-slots | 2.7 | 0.5 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
+| after | pack-slots early-prefetch | 3.2 | 0.8 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
+
 ## Phone
 
 ### Page Prefetch

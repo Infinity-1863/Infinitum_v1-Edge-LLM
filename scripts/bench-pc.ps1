@@ -140,6 +140,7 @@ if ($Profile -eq "page-prefetch") {
   $env:LLAMA_INFINITUM_EXPERT_PREFETCH = "1"
   $env:LLAMA_INFINITUM_GGML_PACK_PREFETCH = "1"
   $env:LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS = "$PrefetchMaxExperts"
+  $env:LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD = "1"
   $env:LLAMA_INFINITUM_EXPERT_CACHE_MB = "$ExpertCacheMiB"
   $env:LLAMA_INFINITUM_EXPERT_PACKED_CACHE_MB = "$PackedExpertCacheMiB"
 } elseif ($Profile -eq "streaming") {

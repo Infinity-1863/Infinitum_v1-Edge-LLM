@@ -65,6 +65,11 @@ function Measure-ProfileLines {
   $downMs = 0.0
   $loadedBytes = [int64]0
   $cacheMisses = [int64]0
+  $cacheHits = [int64]0
+  $predictionHits = [int64]0
+  $predictionCount = [int64]0
+  $predictionWaste = [int64]0
+  $prefetchSubmitMs = 0.0
   foreach ($line in $Lines) {
     $marker = "LLAMA_INFINITUM_PROFILE "
     $idx = $line.IndexOf($marker)
@@ -80,8 +85,14 @@ function Measure-ProfileLines {
       $downMs += [double]$profile.down_ms
       $loadedBytes += [int64]$profile.loaded_bytes_delta
       $cacheMisses += [int64]$profile.cache_misses_delta
+      $cacheHits += [int64]$profile.cache_hits_delta
+      $predictionHits += [int64]$profile.prediction_hits
+      $predictionCount += [int64]$profile.prediction_count
+      $predictionWaste += [int64]$profile.prediction_waste
+      $prefetchSubmitMs += [double]$profile.prefetch_submit_ms
     } catch {}
   }
+  $totalCache = $cacheHits + $cacheMisses
   [ordered]@{
     profile_lines = $count
     load_ms_sum = [math]::Round($loadMs, 3)
@@ -90,7 +101,14 @@ function Measure-ProfileLines {
     activation_ms_sum = [math]::Round($activationMs, 3)
     down_ms_sum = [math]::Round($downMs, 3)
     loaded_bytes_sum = $loadedBytes
+    cache_hits_sum = $cacheHits
     cache_misses_sum = $cacheMisses
+    cache_hit_rate = if ($totalCache -gt 0) { [math]::Round($cacheHits / $totalCache, 4) } else { $null }
+    prediction_hits_sum = $predictionHits
+    prediction_count_sum = $predictionCount
+    prediction_waste_sum = $predictionWaste
+    prediction_hit_rate = if ($predictionCount -gt 0) { [math]::Round($predictionHits / $predictionCount, 4) } else { $null }
+    prefetch_submit_ms_sum = [math]::Round($prefetchSubmitMs, 3)
   }
 }
 
@@ -115,7 +133,8 @@ if ($Profile -eq "page-prefetch") {
   $envParts += @(
     "LLAMA_INFINITUM_EXPERT_PREFETCH=1",
     "LLAMA_INFINITUM_GGML_PACK_PREFETCH=1",
-    "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS=$PrefetchMaxExperts"
+    "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS=$PrefetchMaxExperts",
+    "LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD=1"
   )
 }
 foreach ($entry in $ExtraEnv) {

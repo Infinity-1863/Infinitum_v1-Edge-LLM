@@ -23,6 +23,17 @@ function Assert-Contains {
   }
 }
 
+function Assert-Matches {
+  param(
+    [string]$Haystack,
+    [string]$Pattern,
+    [string]$Message
+  )
+  if ($Haystack -notmatch $Pattern) {
+    throw "ASSERT FAILED: $Message`nExpected pattern: $Pattern"
+  }
+}
+
 $requiredFiles = @(
   "README.md",
   "docs\INDEX.md",
@@ -115,6 +126,7 @@ try {
   Assert-Contains $benchSource "page-prefetch" "PC bench should expose universal page-prefetch profile"
   Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH" "PC bench should enable GGML pack page prefetch"
   Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS" "PC bench should bound page prefetch pressure"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD = `"1`"" "PC page-prefetch profile should keep the stable L+1 default"
   Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_TOUCH_FALLBACK" "PC bench should clear opt-in touch fallback"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR" "PC bench should keep learned prediction available for streaming diagnostics"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_GPU_GLOBAL_SLOTS" "PC bench should support bounded global GPU expert slots"
@@ -122,6 +134,17 @@ try {
   $runtimeSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\src\llama-infinitum-moe.cpp") -Raw
   Assert-Contains $runtimeSource "LLAMA_INFINITUM_SELECTIVE_MOE" "bundled runtime should contain external expert support"
   Assert-Contains $runtimeSource "LLAMA_INFINITUM_EXPERT_ROW_THREADS" "bundled runtime should contain full-model row threading knob"
+  $openAiMoeSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\src\models\openai-moe.cpp") -Raw
+  Assert-Contains $openAiMoeSource "prefetch_submit_ms" "OpenAI-MoE profile should expose early prefetch submit latency"
+  Assert-Contains $openAiMoeSource "prediction_hits" "OpenAI-MoE profile should expose predictor hit count"
+  Assert-Matches $openAiMoeSource "llama_openai_moe_infinitum_expert_predictor_top_k\(\)\s*\{(?s:.*?)value == nullptr(?s:.*?)return 4;(?s:.*?)parsed <= 0(?s:.*?)return 4;" "OpenAI-MoE predictor top-k fallback should stay at safe top-4 unless explicitly overridden"
+  Assert-Matches $openAiMoeSource "llama_openai_moe_infinitum_expert_predictor_lookahead\(\)\s*\{(?s:.*?)value == nullptr(?s:.*?)return 1;(?s:.*?)parsed <= 0(?s:.*?)return 1;" "OpenAI-MoE predictor lookahead fallback should stay at safe L+1 unless explicitly overridden"
+  $prefetchIndex = $openAiMoeSource.IndexOf("prefetch_prediction =`r`n            llama_openai_moe_infinitum_prefetch_learned_next_layers")
+  if ($prefetchIndex -lt 0) {
+    $prefetchIndex = $openAiMoeSource.IndexOf("prefetch_prediction =`n            llama_openai_moe_infinitum_prefetch_learned_next_layers")
+  }
+  $executeIndex = if ($prefetchIndex -ge 0) { $openAiMoeSource.IndexOf("llama_infinitum_moe_execute_selected_experts_into", $prefetchIndex) } else { -1 }
+  Assert-True ($prefetchIndex -ge 0 -and $executeIndex -ge 0 -and $prefetchIndex -lt $executeIndex) "OpenAI-MoE should submit lookahead prefetch before selected expert compute"
 
   $phoneBenchPlan = & (Join-Path $RepoRoot "scripts\bench-phone.ps1") `
     -DeviceDir "/data/local/tmp/infinitum-edge-smoke" `
@@ -131,10 +154,12 @@ try {
     -DryRun 2>&1 | Out-String
   Assert-Contains $phoneBenchPlan "LLAMA_INFINITUM_GGML_PACK_PREFETCH=1" "phone bench should enable GGML pack page prefetch"
   Assert-Contains $phoneBenchPlan "LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS=1" "phone bench should bound page prefetch pressure"
+  Assert-Contains $phoneBenchPlan "LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD=1" "phone bench should keep the stable L+1 page-prefetch default"
   Assert-Contains $phoneBenchPlan "POST http://127.0.0.1:18110/completion" "phone bench should describe the forwarded completion endpoint"
   $phoneBenchSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\bench-phone.ps1") -Raw
   Assert-Contains $phoneBenchSource "LLAMA_INFINITUM_PROFILE" "phone bench should preserve profile env support through ExtraEnv"
   Assert-Contains $phoneBenchSource "compute_ms_sum" "phone bench should aggregate runtime profile compute time"
+  Assert-Contains $phoneBenchSource "prediction_hit_rate" "phone bench should aggregate runtime predictor hit rate"
   $phoneSweepSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\sweep-phone-full.ps1") -Raw
   Assert-Contains $phoneSweepSource "LLAMA_INFINITUM_EXPERT_BACKEND=simd" "phone sweep should test full-model SIMD backend"
   Assert-Contains $phoneSweepSource "PrefetchMaxExperts = 4" "phone sweep should test wider full-model prefetch"
