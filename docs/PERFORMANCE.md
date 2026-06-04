@@ -45,6 +45,9 @@ Phone package: `/data/local/tmp/infinitum-edge-gpt-oss-20b`
 | current | graph | 2.9 | 1.9 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
 | before | pack-slots | 2.7 | 0.5 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
 | after | pack-slots early-prefetch | 3.2 | 0.8 | `gpt_oss_120b_laptop_prefetch_summary_20260604.json` |
+| before | graph, 4 threads | 1.4 | 2.35 | `pc-bench-120b-queue/20260604-134409-baseline.result.json` |
+| after | graph predictor-prefetch, 4 threads | 1.41 | 3.16 | `pc-bench-120b-queue/20260604-135330-page-prefetch.result.json` |
+| best | graph, auto threads | 2.82 | 3.24 | `pc-bench-120b-queue/20260604-135530-baseline.result.json` |
 
 ## Phone
 

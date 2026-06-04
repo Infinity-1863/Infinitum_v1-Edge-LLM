@@ -580,6 +580,22 @@ static bool llama_infinitum_moe_ggml_pack_prefetch_touch_fallback_enabled() {
     return llama_infinitum_env_enabled("LLAMA_INFINITUM_GGML_PACK_PREFETCH_TOUCH_FALLBACK");
 }
 
+static int llama_infinitum_moe_prefetch_max_pending_from_env() {
+    const char * value = std::getenv("LLAMA_INFINITUM_PREFETCH_MAX_PENDING");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    char * end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) {
+        return 1;
+    }
+    if (parsed > 64) {
+        parsed = 64;
+    }
+    return static_cast<int>(parsed);
+}
+
 std::uint64_t llama_infinitum_moe_cache_bytes_from_env() {
     const char * value = std::getenv("LLAMA_INFINITUM_EXPERT_CACHE_MB");
     std::uint64_t mb = 1024;
@@ -3132,11 +3148,19 @@ public:
             seen_jobs.clear();
         }
         seen_jobs.insert(signature);
-        coalesce_layer_jobs(layer_index);
-        if (jobs.size() >= 16) {
+        int dropped = coalesce_layer_jobs(layer_index);
+        const int max_pending = llama_infinitum_moe_prefetch_max_pending_from_env();
+        while (static_cast<int>(jobs.size()) >= max_pending) {
+            seen_jobs.erase(jobs.front().signature);
             jobs.pop_front();
+            ++dropped;
         }
-        jobs.push_back(job{&info, &cache, layer_index, expert_ids});
+        jobs.push_back(job{&info, &cache, layer_index, expert_ids, signature});
+        if (dropped > 0 && llama_infinitum_pack_report_enabled()) {
+            std::fprintf(stderr,
+                    "infinitum_prefetch_queue: layer=%d experts=%zu pending=%zu max_pending=%d dropped=%d\n",
+                    layer_index, expert_ids.size(), jobs.size(), max_pending, dropped);
+        }
         cv.notify_one();
     }
 
@@ -3146,6 +3170,7 @@ private:
         llama_infinitum_moe_slice_cache * cache = nullptr;
         int layer_index = -1;
         std::vector<int> expert_ids;
+        std::uint64_t signature = 0;
     };
 
     std::mutex mutex;
@@ -3168,15 +3193,19 @@ private:
         return hash;
     }
 
-    void coalesce_layer_jobs(int layer_index) {
+    int coalesce_layer_jobs(int layer_index) {
+        int dropped = 0;
         for (auto it = jobs.begin(); it != jobs.end();) {
             const job & pending = *it;
             if (pending.layer_index == layer_index) {
+                seen_jobs.erase(pending.signature);
                 it = jobs.erase(it);
+                ++dropped;
             } else {
                 ++it;
             }
         }
+        return dropped;
     }
 
     void loop() {
@@ -3203,6 +3232,10 @@ private:
                 } else {
                     llama_infinitum_moe_prefetch_selected_experts(
                         *current.info, *current.cache, current.layer_index, current.expert_ids, error);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    seen_jobs.erase(current.signature);
                 }
             }
         }

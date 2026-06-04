@@ -215,6 +215,12 @@ static void llama_openai_moe_infinitum_append_unique_limited(
     }
 }
 
+static void llama_openai_moe_infinitum_truncate(std::vector<int> & values, int limit) {
+    if (limit > 0 && static_cast<int>(values.size()) > limit) {
+        values.resize(static_cast<std::size_t>(limit));
+    }
+}
+
 static int llama_openai_moe_infinitum_intersection_count(
         const std::vector<int> & predicted,
         const std::vector<int> & selected) {
@@ -322,6 +328,8 @@ static llama_openai_moe_infinitum_prefetch_prediction llama_openai_moe_infinitum
         if (predictor_lookahead >= 2 && prediction.next_2.empty()) {
             llama_openai_moe_infinitum_append_unique_limited(prediction.next_2, prediction.next_1, predictor_top_k);
         }
+        llama_openai_moe_infinitum_truncate(prediction.next_1, predictor_top_k);
+        llama_openai_moe_infinitum_truncate(prediction.next_2, predictor_top_k);
         if (!prediction.next_1.empty() && layer_index + 1 < static_cast<int>(state.predicted_by_layer.size())) {
             state.predicted_by_layer[std::size_t(layer_index + 1)] = prediction.next_1;
         }
@@ -390,6 +398,7 @@ struct llama_openai_moe_infinitum_prefetch_userdata {
     llama_infinitum_moe_slice_cache * cache = nullptr;
     int layer_index = -1;
     int lookahead = 1;
+    int selected_expert_count = 0;
 };
 
 static llama_openai_moe_infinitum_external_mlp_userdata * llama_openai_moe_infinitum_external_mlp_userdata_for_layer(
@@ -413,7 +422,8 @@ static llama_openai_moe_infinitum_prefetch_userdata * llama_openai_moe_infinitum
         const llama_infinitum_moe_index_info & expert_index,
         llama_infinitum_moe_slice_cache & cache,
         int layer_index,
-        int lookahead = 1) {
+        int lookahead = 1,
+        int selected_expert_count = 0) {
     static std::array<llama_openai_moe_infinitum_prefetch_userdata, 64> userdata_by_layer = {};
     if (layer_index < 0 || layer_index >= int(userdata_by_layer.size())) {
         GGML_ABORT("LLAMA_INFINITUM_GGML_PACK_PREFETCH layer index exceeds userdata cache");
@@ -423,6 +433,7 @@ static llama_openai_moe_infinitum_prefetch_userdata * llama_openai_moe_infinitum
     userdata.cache = &cache;
     userdata.layer_index = layer_index;
     userdata.lookahead = std::max(1, std::min(lookahead, 4));
+    userdata.selected_expert_count = std::max(0, selected_expert_count);
     return &userdata;
 }
 
@@ -598,28 +609,35 @@ static void llama_openai_moe_infinitum_prefetch_selected_op(
     }
 
     std::vector<int> selected;
+    std::vector<int> router_selected;
     const int64_t n_expert_used = selected_tensor->ne[0];
     const int64_t n_tokens = std::max<int64_t>(1, selected_tensor->ne[1]);
     const int max_prefetch_experts = llama_openai_moe_infinitum_ggml_pack_prefetch_max_experts();
+    const int router_expert_count = data->selected_expert_count > 0 ?
+        std::min<int>(data->selected_expert_count, static_cast<int>(n_expert_used)) :
+        static_cast<int>(n_expert_used);
     selected.reserve(std::size_t(max_prefetch_experts));
+    router_selected.reserve(std::size_t(router_expert_count));
     for (int64_t token = 0; token < n_tokens; ++token) {
         for (int64_t k = 0; k < n_expert_used; ++k) {
             const int expert_id = llama_openai_moe_tensor_i32(dst, k, token);
-            llama_openai_moe_infinitum_append_unique(selected, expert_id, max_prefetch_experts);
-            if (static_cast<int>(selected.size()) >= max_prefetch_experts) {
-                break;
+            if (k < router_expert_count) {
+                llama_openai_moe_infinitum_append_unique(router_selected, expert_id, router_expert_count);
+            }
+            if (static_cast<int>(selected.size()) < max_prefetch_experts) {
+                llama_openai_moe_infinitum_append_unique(selected, expert_id, max_prefetch_experts);
             }
         }
-        if (static_cast<int>(selected.size()) >= max_prefetch_experts) {
+        if (!router_selected.empty()) {
             break;
         }
     }
-    if (!selected.empty()) {
-        for (int delta = 1; delta <= data->lookahead; ++delta) {
-            const int target_layer = data->layer_index + delta;
-            llama_infinitum_moe_prefetch_selected_experts_async(
-                *data->expert_index, *data->cache, target_layer, selected);
-        }
+    const std::vector<int> & predictor_input = !router_selected.empty() ? router_selected : selected;
+    if (!predictor_input.empty()) {
+        llama_openai_moe_infinitum_prefetch_learned_next_layers(
+            *data->expert_index, *data->cache, data->layer_index, predictor_input);
+        llama_openai_moe_infinitum_learned_predictor_record(
+            *data->expert_index, data->layer_index, predictor_input);
     }
 }
 
@@ -998,7 +1016,8 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
                                 expert_index,
                                 cache,
                                 static_cast<int>(il),
-                                llama_openai_moe_infinitum_expert_predictor_lookahead());
+                                llama_openai_moe_infinitum_expert_predictor_lookahead(),
+                                static_cast<int>(n_expert_used));
                             ggml_tensor * prefetch_ids = ggml_map_custom1(ctx0, prefetch_experts,
                                     llama_openai_moe_infinitum_prefetch_selected_op, 1, userdata);
                             cb(prefetch_ids, "ffn_moe_topk_external_prefetch", il);
