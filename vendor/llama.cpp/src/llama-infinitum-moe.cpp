@@ -565,7 +565,12 @@ bool llama_infinitum_moe_two_phase_bridge_enabled() {
 }
 
 bool llama_infinitum_moe_ggml_pack_enabled() {
-    return llama_infinitum_env_enabled("LLAMA_INFINITUM_V2_GGML_EXPERT_PACK");
+    return llama_infinitum_env_enabled("LLAMA_INFINITUM_V2_GGML_EXPERT_PACK") ||
+        llama_infinitum_moe_ggml_split_pack_enabled();
+}
+
+bool llama_infinitum_moe_ggml_split_pack_enabled() {
+    return llama_infinitum_env_enabled("LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK");
 }
 
 bool llama_infinitum_moe_ggml_pack_slots_enabled() {
@@ -667,6 +672,10 @@ static int llama_infinitum_moe_gpu_global_slots_from_env() {
 
 static bool llama_infinitum_moe_gpu_global_slots_enabled() {
     return llama_infinitum_moe_gpu_global_slots_from_env() > 0;
+}
+
+static bool llama_infinitum_moe_gpu_prefetch_blocking_enabled() {
+    return llama_infinitum_env_enabled("LLAMA_INFINITUM_PREFETCH_GPU_BLOCKING");
 }
 
 static int llama_infinitum_moe_gpu_selected_slots_from_env() {
@@ -814,6 +823,11 @@ static const char * llama_infinitum_moe_backend_name(llama_infinitum_moe_backend
     }
 }
 
+static bool llama_infinitum_moe_backend_uses_gpu_slots(llama_infinitum_moe_backend_kind backend) {
+    return backend == llama_infinitum_moe_backend_kind::vulkan ||
+        backend == llama_infinitum_moe_backend_kind::fused_arena;
+}
+
 static std::string llama_infinitum_moe_fused_target_from_env() {
     const char * value = std::getenv("LLAMA_INFINITUM_EXPERT_FUSED_TARGET");
     if (value == nullptr || value[0] == '\0') {
@@ -914,14 +928,31 @@ static int llama_infinitum_moe_expert_count(const llama_infinitum_moe_index_info
     return count;
 }
 
-static std::string llama_infinitum_moe_ggml_pack_path(const llama_infinitum_moe_index_info & info) {
-    const char * explicit_path = std::getenv("LLAMA_INFINITUM_V2_GGML_EXPERT_PACK");
+static std::string llama_infinitum_moe_ggml_pack_path_for(
+        const llama_infinitum_moe_index_info & info,
+        const char * env_name,
+        const char * default_file) {
+    const char * explicit_path = std::getenv(env_name);
     if (explicit_path != nullptr && explicit_path[0] != '\0' && explicit_path[0] != '1') {
         return explicit_path;
     }
     return llama_infinitum_join_path(
         llama_infinitum_join_path(llama_infinitum_dirname(llama_infinitum_dirname(info.path)), "moe_ggml_pack"),
+        default_file);
+}
+
+static std::string llama_infinitum_moe_ggml_pack_path(const llama_infinitum_moe_index_info & info) {
+    return llama_infinitum_moe_ggml_pack_path_for(
+        info,
+        "LLAMA_INFINITUM_V2_GGML_EXPERT_PACK",
         "experts.ggml_mxfp4.bin");
+}
+
+static std::string llama_infinitum_moe_ggml_split_pack_path(const llama_infinitum_moe_index_info & info) {
+    return llama_infinitum_moe_ggml_pack_path_for(
+        info,
+        "LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK",
+        "experts.split.ggml_mxfp4.bin");
 }
 
 struct llama_infinitum_ggml_pack_mapping {
@@ -935,6 +966,8 @@ struct llama_infinitum_ggml_pack_expert_layout {
     std::size_t gate_up_bias_expert_bytes = 0;
     std::size_t down_bias_expert_bytes = 0;
     std::size_t gate_up_offset = 0;
+    std::size_t gate_offset = 0;
+    std::size_t up_offset = 0;
     std::size_t down_offset = 0;
     std::size_t gate_up_bias_offset = 0;
     std::size_t down_bias_offset = 0;
@@ -1013,7 +1046,9 @@ static bool llama_infinitum_ggml_pack_expert_layout_for(
 
     layout.matrix_expert_bytes = std::size_t(hidden_size) * std::size_t(block_count) * 17ull;
     layout.gate_up_expert_bytes = layout.matrix_expert_bytes * 2ull;
-    const std::size_t gate_up_all_bytes = layout.gate_up_expert_bytes * std::size_t(experts);
+    const std::size_t gate_all_bytes = layout.matrix_expert_bytes * std::size_t(experts);
+    const std::size_t up_all_bytes = layout.matrix_expert_bytes * std::size_t(experts);
+    const std::size_t gate_up_all_bytes = gate_all_bytes + up_all_bytes;
     const std::size_t down_all_bytes = layout.matrix_expert_bytes * std::size_t(experts);
     layout.gate_up_bias_expert_bytes = std::size_t(hidden_size) * 2ull * sizeof(float);
     layout.down_bias_expert_bytes = std::size_t(hidden_size) * sizeof(float);
@@ -1021,9 +1056,18 @@ static bool llama_infinitum_ggml_pack_expert_layout_for(
     const std::size_t down_bias_all_bytes = layout.down_bias_expert_bytes * std::size_t(experts);
     const std::size_t layer_bytes = gate_up_all_bytes + down_all_bytes + gate_up_bias_all_bytes + down_bias_all_bytes;
     const std::size_t layer_base = std::size_t(layer_index) * layer_bytes;
+    const std::size_t expert_matrix_offset = std::size_t(expert_id) * layout.matrix_expert_bytes;
 
-    layout.gate_up_offset = layer_base + std::size_t(expert_id) * layout.gate_up_expert_bytes;
-    layout.down_offset = layer_base + gate_up_all_bytes + std::size_t(expert_id) * layout.matrix_expert_bytes;
+    if (llama_infinitum_moe_ggml_split_pack_enabled()) {
+        layout.gate_offset = layer_base + expert_matrix_offset;
+        layout.up_offset = layer_base + gate_all_bytes + expert_matrix_offset;
+        layout.gate_up_offset = layout.gate_offset;
+    } else {
+        layout.gate_up_offset = layer_base + std::size_t(expert_id) * layout.gate_up_expert_bytes;
+        layout.gate_offset = layout.gate_up_offset;
+        layout.up_offset = layout.gate_up_offset + layout.matrix_expert_bytes;
+    }
+    layout.down_offset = layer_base + gate_up_all_bytes + expert_matrix_offset;
     layout.gate_up_bias_offset = layer_base + gate_up_all_bytes + down_all_bytes + std::size_t(expert_id) * layout.gate_up_bias_expert_bytes;
     layout.down_bias_offset = layer_base + gate_up_all_bytes + down_all_bytes + gate_up_bias_all_bytes + std::size_t(expert_id) * layout.down_bias_expert_bytes;
     (void) down_bias_all_bytes;
@@ -1215,8 +1259,9 @@ ggml_tensor * llama_infinitum_moe_ggml_pack_tensor(
     }
 
     const std::size_t matrix_expert_bytes = std::size_t(hidden) * std::size_t(blocks) * 17ull;
-    const std::size_t gate_up_expert_bytes = matrix_expert_bytes * 2ull;
-    const std::size_t gate_up_all_bytes = gate_up_expert_bytes * std::size_t(experts);
+    const std::size_t gate_all_bytes = matrix_expert_bytes * std::size_t(experts);
+    const std::size_t up_all_bytes = matrix_expert_bytes * std::size_t(experts);
+    const std::size_t gate_up_all_bytes = gate_all_bytes + up_all_bytes;
     const std::size_t down_all_bytes = matrix_expert_bytes * std::size_t(experts);
     const std::size_t gate_up_bias_all_bytes = std::size_t(hidden) * 2ull * sizeof(float) * std::size_t(experts);
     const std::size_t down_bias_all_bytes = std::size_t(hidden) * sizeof(float) * std::size_t(experts);
@@ -1227,34 +1272,59 @@ ggml_tensor * llama_infinitum_moe_ggml_pack_tensor(
     int64_t ne[3] = { hidden, hidden, experts };
     std::size_t offset = layer_base;
     std::size_t nbytes = gate_up_all_bytes;
+    bool use_split_pack = llama_infinitum_moe_ggml_split_pack_enabled();
+    bool split_only_kind = false;
     if (std::strcmp(kind, "gate_up") == 0) {
         type = GGML_TYPE_MXFP4;
         ne[1] = hidden * 2;
+        use_split_pack = false;
+    } else if (std::strcmp(kind, "gate") == 0) {
+        if (!use_split_pack) {
+            return nullptr;
+        }
+        split_only_kind = true;
+        type = GGML_TYPE_MXFP4;
+        nbytes = gate_all_bytes;
+    } else if (std::strcmp(kind, "up") == 0) {
+        if (!use_split_pack) {
+            return nullptr;
+        }
+        split_only_kind = true;
+        type = GGML_TYPE_MXFP4;
+        offset = layer_base + gate_all_bytes;
+        nbytes = up_all_bytes;
     } else if (std::strcmp(kind, "down") == 0) {
         type = GGML_TYPE_MXFP4;
-        offset = layer_base + gate_up_all_bytes;
+        offset = layer_base + gate_all_bytes + up_all_bytes;
         nbytes = down_all_bytes;
     } else if (std::strcmp(kind, "gate_up_bias") == 0) {
         type = GGML_TYPE_F32;
         ne[0] = hidden * 2;
         ne[1] = experts;
         ne[2] = 1;
-        offset = layer_base + gate_up_all_bytes + down_all_bytes;
+        offset = layer_base + gate_all_bytes + up_all_bytes + down_all_bytes;
         nbytes = gate_up_bias_all_bytes;
     } else if (std::strcmp(kind, "down_bias") == 0) {
         type = GGML_TYPE_F32;
         ne[0] = hidden;
         ne[1] = experts;
         ne[2] = 1;
-        offset = layer_base + gate_up_all_bytes + down_all_bytes + gate_up_bias_all_bytes;
+        offset = layer_base + gate_all_bytes + up_all_bytes + down_all_bytes + gate_up_bias_all_bytes;
         nbytes = down_bias_all_bytes;
     } else {
         return nullptr;
     }
 
-    const std::string pack_path = llama_infinitum_moe_ggml_pack_path(info);
+    std::string pack_path = use_split_pack ?
+        llama_infinitum_moe_ggml_split_pack_path(info) :
+        llama_infinitum_moe_ggml_pack_path(info);
     std::string error;
     auto mapping = llama_infinitum_moe_ggml_pack_mapping_for(pack_path, error);
+    if ((mapping == nullptr || offset + nbytes > mapping->file->size()) && use_split_pack && !split_only_kind) {
+        pack_path = llama_infinitum_moe_ggml_pack_path(info);
+        error.clear();
+        mapping = llama_infinitum_moe_ggml_pack_mapping_for(pack_path, error);
+    }
     if (mapping == nullptr || offset + nbytes > mapping->file->size()) {
         return nullptr;
     }
@@ -1347,7 +1417,9 @@ ggml_tensor * llama_infinitum_moe_ggml_pack_tensor_shaped(
         return nullptr;
     }
 
-    const std::string pack_path = llama_infinitum_moe_ggml_pack_path(info);
+    const std::string pack_path = llama_infinitum_moe_ggml_split_pack_enabled() ?
+        llama_infinitum_moe_ggml_split_pack_path(info) :
+        llama_infinitum_moe_ggml_pack_path(info);
     std::string error;
     auto mapping = llama_infinitum_moe_ggml_pack_mapping_for(pack_path, error);
     if (mapping == nullptr || offset + nbytes > mapping->file->size()) {
@@ -2818,7 +2890,8 @@ static std::shared_ptr<const llama_infinitum_ggml_packed_expert_mlp> llama_infin
         return nullptr;
     }
     const std::size_t file_size = mapping->file->size();
-    if (layout.gate_up_offset + layout.gate_up_expert_bytes > file_size ||
+    if (layout.gate_offset + layout.matrix_expert_bytes > file_size ||
+            layout.up_offset + layout.matrix_expert_bytes > file_size ||
             layout.down_offset + layout.matrix_expert_bytes > file_size ||
             layout.gate_up_bias_offset + layout.gate_up_bias_expert_bytes > file_size ||
             layout.down_bias_offset + layout.down_bias_expert_bytes > file_size) {
@@ -2833,8 +2906,8 @@ static std::shared_ptr<const llama_infinitum_ggml_packed_expert_mlp> llama_infin
     packed->mapped_owner = mapping;
     packed->mapped_matrix_bytes = layout.matrix_expert_bytes;
     packed->mapped_hidden_size = hidden_size;
-    packed->mapped_gate_blocks = base + layout.gate_up_offset;
-    packed->mapped_up_blocks = base + layout.gate_up_offset + layout.matrix_expert_bytes;
+    packed->mapped_gate_blocks = base + layout.gate_offset;
+    packed->mapped_up_blocks = base + layout.up_offset;
     packed->mapped_down_blocks = base + layout.down_offset;
     packed->mapped_gate_bias = reinterpret_cast<const float *>(base + layout.gate_up_bias_offset);
     packed->mapped_up_bias = reinterpret_cast<const float *>(base + layout.gate_up_bias_offset + std::size_t(hidden_size) * sizeof(float));
@@ -2854,7 +2927,9 @@ static bool llama_infinitum_prefetch_ggml_pack_expert_pages(
         return false;
     }
 
-    const std::string pack_path = llama_infinitum_moe_ggml_pack_path(info);
+    const std::string pack_path = llama_infinitum_moe_ggml_split_pack_enabled() ?
+        llama_infinitum_moe_ggml_split_pack_path(info) :
+        llama_infinitum_moe_ggml_pack_path(info);
     auto mapping = llama_infinitum_moe_ggml_pack_mapping_for(pack_path, error);
     if (mapping == nullptr) {
         if (error.empty()) {
@@ -2863,7 +2938,8 @@ static bool llama_infinitum_prefetch_ggml_pack_expert_pages(
         return false;
     }
     const std::size_t file_size = mapping->file->size();
-    if (layout.gate_up_offset + layout.gate_up_expert_bytes > file_size ||
+    if (layout.gate_offset + layout.matrix_expert_bytes > file_size ||
+            layout.up_offset + layout.matrix_expert_bytes > file_size ||
             layout.down_offset + layout.matrix_expert_bytes > file_size ||
             layout.gate_up_bias_offset + layout.gate_up_bias_expert_bytes > file_size ||
             layout.down_bias_offset + layout.down_bias_expert_bytes > file_size) {
@@ -2872,7 +2948,8 @@ static bool llama_infinitum_prefetch_ggml_pack_expert_pages(
     }
 
     const auto * base = static_cast<const std::uint8_t *>(mapping->mapping->addr());
-    llama_infinitum_prefetch_memory_range(base + layout.gate_up_offset, layout.gate_up_expert_bytes);
+    llama_infinitum_prefetch_memory_range(base + layout.gate_offset, layout.matrix_expert_bytes);
+    llama_infinitum_prefetch_memory_range(base + layout.up_offset, layout.matrix_expert_bytes);
     llama_infinitum_prefetch_memory_range(base + layout.down_offset, layout.matrix_expert_bytes);
     llama_infinitum_prefetch_memory_range(base + layout.gate_up_bias_offset, layout.gate_up_bias_expert_bytes);
     llama_infinitum_prefetch_memory_range(base + layout.down_bias_offset, layout.down_bias_expert_bytes);
@@ -3222,12 +3299,13 @@ private:
             }
             if (current.info != nullptr && current.cache != nullptr) {
                 std::string error;
-                if (llama_infinitum_moe_ggml_pack_enabled() && llama_infinitum_moe_ggml_pack_prefetch_enabled()) {
-                    llama_infinitum_moe_prefetch_selected_ggml_pack_pages(
-                        *current.info, current.layer_index, current.expert_ids, error);
-                } else if (llama_infinitum_moe_ggml_pack_enabled() && llama_infinitum_moe_ggml_pack_slots_enabled() &&
-                        llama_infinitum_moe_backend_kind_from_env() == llama_infinitum_moe_backend_kind::vulkan) {
+                if (llama_infinitum_moe_ggml_pack_enabled() && llama_infinitum_moe_ggml_pack_slots_enabled() &&
+                        !llama_infinitum_moe_gpu_global_slots_enabled() &&
+                        llama_infinitum_moe_backend_uses_gpu_slots(llama_infinitum_moe_backend_kind_from_env())) {
                     llama_infinitum_moe_prefetch_selected_gpu_experts(
+                        *current.info, current.layer_index, current.expert_ids, error);
+                } else if (llama_infinitum_moe_ggml_pack_enabled() && llama_infinitum_moe_ggml_pack_prefetch_enabled()) {
+                    llama_infinitum_moe_prefetch_selected_ggml_pack_pages(
                         *current.info, current.layer_index, current.expert_ids, error);
                 } else {
                     llama_infinitum_moe_prefetch_selected_experts(
@@ -3674,9 +3752,22 @@ public:
         return compute_lock;
     }
 
+    void begin_foreground_wait() {
+        foreground_waiters.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void end_foreground_wait() {
+        foreground_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    bool has_foreground_waiters() const {
+        return foreground_waiters.load(std::memory_order_acquire) > 0;
+    }
+
 private:
     std::mutex mutex;
     std::mutex compute_lock;
+    std::atomic<int> foreground_waiters { 0 };
     bool init_attempted = false;
     ggml_backend_t backend = nullptr;
     ggml_backend_dev_t device = nullptr;
@@ -3685,6 +3776,45 @@ private:
 
 static llama_infinitum_ggml_gpu_backend & llama_infinitum_ggml_gpu_backend_get() {
     static llama_infinitum_ggml_gpu_backend state;
+    return state;
+}
+
+class llama_infinitum_ggml_gpu_upload_backend {
+public:
+    bool get(ggml_backend_dev_t device, ggml_backend_t & out_backend, std::string & error) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (upload_backend != nullptr) {
+            out_backend = upload_backend;
+            return true;
+        }
+        if (device == nullptr) {
+            error = "cannot initialize GPU upload backend without a device";
+            return false;
+        }
+        if (init_attempted) {
+            error = init_error;
+            return false;
+        }
+        init_attempted = true;
+        upload_backend = ggml_backend_dev_init(device, nullptr);
+        if (upload_backend == nullptr) {
+            init_error = "failed to initialize ggml GPU upload backend";
+            error = init_error;
+            return false;
+        }
+        out_backend = upload_backend;
+        return true;
+    }
+
+private:
+    std::mutex mutex;
+    bool init_attempted = false;
+    ggml_backend_t upload_backend = nullptr;
+    std::string init_error;
+};
+
+static llama_infinitum_ggml_gpu_upload_backend & llama_infinitum_ggml_gpu_upload_backend_get() {
+    static llama_infinitum_ggml_gpu_upload_backend state;
     return state;
 }
 
@@ -4089,6 +4219,8 @@ public:
         slot_predicted.assign(slots, 0);
         slot_hit_counts.assign(slots, 0);
         slot_last_used.assign(slots, 0);
+        slot_pin_counts.assign(slots, 0);
+        slot_uploading.assign(slots, 0);
         return true;
     }
 
@@ -4097,7 +4229,9 @@ public:
             ggml_backend_t backend,
             int & out_slot,
             std::string & error,
-            bool predicted_residency = false) {
+            bool predicted_residency = false,
+            bool allow_eviction = true,
+            bool avoid_pinned_slots = false) {
         const std::uint64_t key = expert_key(expert);
         auto found = key_to_slot.find(key);
         if (found != key_to_slot.end()) {
@@ -4109,13 +4243,22 @@ public:
             touch(out_slot, predicted_residency);
             return true;
         }
+        if (uploading_key_to_slot.find(key) != uploading_key_to_slot.end()) {
+            out_slot = uploading_slot_pending;
+            return true;
+        }
         ++slot_misses;
 
         int slot = find_free_slot();
         if (slot < 0) {
-            slot = global_residency ? choose_global_victim_slot() : (lru_slots.empty() ? 0 : lru_slots.front());
+            if (!allow_eviction) {
+                out_slot = -1;
+                return true;
+            }
+            slot = global_residency ? choose_global_victim_slot(avoid_pinned_slots) : choose_lru_victim_slot(avoid_pinned_slots);
             if (slot < 0) {
-                slot = 0;
+                out_slot = -1;
+                return true;
             }
             lru_slots.remove(slot);
             const std::uint64_t previous_key = slot_keys[slot];
@@ -4148,6 +4291,121 @@ public:
         return true;
     }
 
+    bool begin_upload_expert(
+            const llama_infinitum_ggml_packed_expert_mlp & expert,
+            int & out_slot,
+            std::string & error,
+            bool predicted_residency,
+            bool allow_eviction,
+            bool avoid_pinned_slots) {
+        (void) error;
+        const std::uint64_t key = expert_key(expert);
+        auto found = key_to_slot.find(key);
+        if (found != key_to_slot.end()) {
+            touch(found->second, predicted_residency);
+            out_slot = -1;
+            return true;
+        }
+        if (uploading_key_to_slot.find(key) != uploading_key_to_slot.end()) {
+            out_slot = -1;
+            return true;
+        }
+
+        int slot = find_free_slot();
+        if (slot < 0) {
+            if (!allow_eviction) {
+                out_slot = -1;
+                return true;
+            }
+            slot = global_residency ? choose_global_victim_slot(avoid_pinned_slots) : choose_lru_victim_slot(avoid_pinned_slots);
+            if (slot < 0) {
+                out_slot = -1;
+                return true;
+            }
+            lru_slots.remove(slot);
+            const std::uint64_t previous_key = slot_keys[slot];
+            if (previous_key != empty_slot_key) {
+                key_to_slot.erase(previous_key);
+                ++slot_evictions;
+            }
+        }
+
+        slot_keys[slot] = empty_slot_key;
+        if (slot < static_cast<int>(slot_predicted.size())) {
+            slot_predicted[slot] = 0;
+        }
+        if (slot < static_cast<int>(slot_hit_counts.size())) {
+            slot_hit_counts[slot] = 0;
+        }
+        if (slot < static_cast<int>(slot_last_used.size())) {
+            slot_last_used[slot] = 0;
+        }
+        if (slot >= 0 && slot < static_cast<int>(slot_uploading.size())) {
+            slot_uploading[slot] = 1;
+        }
+        uploading_key_to_slot[key] = slot;
+        out_slot = slot;
+        return true;
+    }
+
+    bool upload_reserved_expert(
+            const llama_infinitum_ggml_packed_expert_mlp & expert,
+            ggml_backend_t backend,
+            int slot,
+            std::string & error) {
+        if (slot < 0 || slot >= slots || !slot_is_uploading(slot)) {
+            error = "GPU layer slot cache upload used an unreserved slot";
+            return false;
+        }
+        return upload(slot, expert, backend, error);
+    }
+
+    void finish_upload_expert(
+            const llama_infinitum_ggml_packed_expert_mlp & expert,
+            int slot,
+            bool predicted_residency,
+            bool ok) {
+        const std::uint64_t key = expert_key(expert);
+        if (slot >= 0 && slot < static_cast<int>(slot_uploading.size())) {
+            slot_uploading[slot] = 0;
+        }
+        uploading_key_to_slot.erase(key);
+        if (!ok || slot < 0 || slot >= slots) {
+            return;
+        }
+        slot_keys[slot] = key;
+        key_to_slot[key] = slot;
+        if (slot >= 0 && slot < static_cast<int>(slot_hit_counts.size())) {
+            slot_hit_counts[slot] = predicted_residency ? 0u : 1u;
+        }
+        touch(slot, predicted_residency);
+    }
+
+    void pin_slots(const std::vector<std::int32_t> & local_ids) {
+        for (const std::int32_t local_id : local_ids) {
+            if (local_id >= 0 && local_id < static_cast<std::int32_t>(slot_pin_counts.size())) {
+                ++slot_pin_counts[local_id];
+            }
+        }
+    }
+
+    bool has_uploading_slots() const {
+        for (const std::uint8_t value : slot_uploading) {
+            if (value != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void unpin_slots(const std::vector<std::int32_t> & local_ids) {
+        for (const std::int32_t local_id : local_ids) {
+            if (local_id >= 0 && local_id < static_cast<std::int32_t>(slot_pin_counts.size()) && slot_pin_counts[local_id] > 0) {
+                --slot_pin_counts[local_id];
+            }
+        }
+    }
+
     ggml_tensor * gate_up_weights() const { return gate_up_w; }
     ggml_tensor * down_weights() const { return down_w; }
     ggml_tensor * gate_up_biases() const { return gate_up_b; }
@@ -4177,7 +4435,10 @@ private:
     std::vector<std::uint8_t> slot_predicted;
     std::vector<std::uint32_t> slot_hit_counts;
     std::vector<std::uint64_t> slot_last_used;
+    std::vector<std::uint32_t> slot_pin_counts;
+    std::vector<std::uint8_t> slot_uploading;
     std::unordered_map<std::uint64_t, int> key_to_slot;
+    std::unordered_map<std::uint64_t, int> uploading_key_to_slot;
     std::list<int> lru_slots;
     std::uint64_t access_clock = 0;
     std::uint64_t slot_hits = 0;
@@ -4185,6 +4446,7 @@ private:
     std::uint64_t slot_evictions = 0;
     std::uint64_t cache_uid = 0;
     static constexpr std::uint64_t empty_slot_key = UINT64_MAX;
+    static constexpr int uploading_slot_pending = -2;
     static std::atomic<std::uint64_t> next_cache_uid;
 
     std::uint64_t expert_key(const llama_infinitum_ggml_packed_expert_mlp & expert) const {
@@ -4201,23 +4463,52 @@ private:
         std::fill(slot_predicted.begin(), slot_predicted.end(), 0);
         std::fill(slot_hit_counts.begin(), slot_hit_counts.end(), 0);
         std::fill(slot_last_used.begin(), slot_last_used.end(), 0);
+        std::fill(slot_pin_counts.begin(), slot_pin_counts.end(), 0);
+        std::fill(slot_uploading.begin(), slot_uploading.end(), 0);
         key_to_slot.clear();
+        uploading_key_to_slot.clear();
         lru_slots.clear();
     }
 
     int find_free_slot() const {
         for (int i = 0; i < static_cast<int>(slot_keys.size()); ++i) {
-            if (slot_keys[i] == empty_slot_key) {
+            if (slot_keys[i] == empty_slot_key && !slot_is_pinned(i) && !slot_is_uploading(i)) {
                 return i;
             }
         }
         return -1;
     }
 
-    int choose_global_victim_slot() const {
+    bool slot_is_pinned(int slot) const {
+        return slot >= 0 && slot < static_cast<int>(slot_pin_counts.size()) && slot_pin_counts[slot] > 0;
+    }
+
+    bool slot_is_uploading(int slot) const {
+        return slot >= 0 && slot < static_cast<int>(slot_uploading.size()) && slot_uploading[slot] != 0;
+    }
+
+    int choose_lru_victim_slot(bool avoid_pinned_slots) const {
+        for (const int slot : lru_slots) {
+            if (slot_is_uploading(slot)) {
+                continue;
+            }
+            if (!avoid_pinned_slots || !slot_is_pinned(slot)) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    int choose_global_victim_slot(bool avoid_pinned_slots) const {
         int best_slot = -1;
         std::int64_t best_score = INT64_MAX;
         for (int i = 0; i < static_cast<int>(slot_keys.size()); ++i) {
+            if (slot_is_uploading(i)) {
+                continue;
+            }
+            if (avoid_pinned_slots && slot_is_pinned(i)) {
+                continue;
+            }
             if (slot_keys[i] == empty_slot_key) {
                 return i;
             }
@@ -4349,7 +4640,9 @@ private:
         if (limit <= 0) {
             return true;
         }
-        while (static_cast<int>(layers.size()) >= limit && !layer_lru.empty()) {
+        int attempts = 0;
+        while (static_cast<int>(layers.size()) >= limit && !layer_lru.empty() &&
+                attempts < static_cast<int>(layers.size())) {
             auto victim_it = layer_lru.end();
             for (auto it = layer_lru.begin(); it != layer_lru.end(); ++it) {
                 if (*it < requested_layer) {
@@ -4360,10 +4653,15 @@ private:
             if (victim_it == layer_lru.end()) {
                 return false;
             }
+            ++attempts;
             const int victim = *victim_it;
             layer_lru.erase(victim_it);
             auto found = layers.find(victim);
             if (found != layers.end()) {
+                if (found->second->has_uploading_slots()) {
+                    touch(victim);
+                    continue;
+                }
                 llama_infinitum_debug_log("evicting GPU expert layer cache layer=%d limit=%d bytes=%llu",
                     victim,
                     limit,
@@ -4381,6 +4679,16 @@ static llama_infinitum_ggml_gpu_layer_slot_cache_manager & llama_infinitum_ggml_
     return manager;
 }
 
+static std::mutex & llama_infinitum_ggml_gpu_slot_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::condition_variable & llama_infinitum_ggml_gpu_slot_cache_cv() {
+    static std::condition_variable cv;
+    return cv;
+}
+
 bool llama_infinitum_moe_prefetch_selected_gpu_experts(
         const llama_infinitum_moe_index_info & info,
         int layer_index,
@@ -4395,9 +4703,8 @@ bool llama_infinitum_moe_prefetch_selected_gpu_experts(
         return false;
     }
     const llama_infinitum_moe_backend_kind backend_kind = llama_infinitum_moe_backend_kind_from_env();
-    if (backend_kind != llama_infinitum_moe_backend_kind::vulkan &&
-            backend_kind != llama_infinitum_moe_backend_kind::fused_arena) {
-        error = "GPU expert prefetch requires Vulkan expert backend";
+    if (!llama_infinitum_moe_backend_uses_gpu_slots(backend_kind)) {
+        error = "GPU expert prefetch requires a GPU slot expert backend";
         return false;
     }
 
@@ -4414,7 +4721,10 @@ bool llama_infinitum_moe_prefetch_selected_gpu_experts(
     if (!state.get(backend, device, error)) {
         return false;
     }
-    (void) device;
+    ggml_backend_t upload_backend = nullptr;
+    if (!llama_infinitum_ggml_gpu_upload_backend_get().get(device, upload_backend, error)) {
+        return false;
+    }
 
     llama_infinitum_ggml_pack_expert_cache & pack_cache = llama_infinitum_ggml_pack_expert_cache_get();
     std::vector<std::shared_ptr<const llama_infinitum_ggml_packed_expert_mlp>> packed_experts;
@@ -4437,26 +4747,66 @@ bool llama_infinitum_moe_prefetch_selected_gpu_experts(
         packed_experts.push_back(std::move(packed));
     }
 
-    std::unique_lock<std::mutex> compute_guard(state.compute_mutex(), std::try_to_lock);
-    if (!compute_guard.owns_lock()) {
+    const bool blocking_prefetch = llama_infinitum_moe_gpu_prefetch_blocking_enabled();
+    auto acquire_slot_cache = [&](std::unique_lock<std::mutex> & slot_guard) {
+        if (blocking_prefetch) {
+            slot_guard.lock();
+            return true;
+        }
+        if (state.has_foreground_waiters()) {
+            return false;
+        }
+        if (!slot_guard.try_lock()) {
+            return false;
+        }
+        if (state.has_foreground_waiters()) {
+            slot_guard.unlock();
+            return false;
+        }
         return true;
-    }
-    llama_infinitum_ggml_gpu_layer_slot_cache & layer_cache =
-        llama_infinitum_ggml_gpu_layer_slot_cache_manager_get().get_layer(layer_index);
-    if (!layer_cache.init(
-            layer_index,
-            hidden_size,
-            llama_infinitum_moe_gpu_selected_slots_from_env(),
-            llama_infinitum_moe_gpu_global_slots_enabled(),
-            backend,
-            error)) {
-        return false;
+    };
+
+    {
+        std::unique_lock<std::mutex> slot_guard(llama_infinitum_ggml_gpu_slot_cache_mutex(), std::defer_lock);
+        if (!acquire_slot_cache(slot_guard)) {
+            return true;
+        }
+        llama_infinitum_ggml_gpu_layer_slot_cache & layer_cache =
+            llama_infinitum_ggml_gpu_layer_slot_cache_manager_get().get_layer(layer_index);
+        if (!layer_cache.init(
+                layer_index,
+                hidden_size,
+                llama_infinitum_moe_gpu_selected_slots_from_env(),
+                llama_infinitum_moe_gpu_global_slots_enabled(),
+                upload_backend,
+                error)) {
+            return false;
+        }
     }
 
     for (const std::shared_ptr<const llama_infinitum_ggml_packed_expert_mlp> & packed : packed_experts) {
+        llama_infinitum_ggml_gpu_layer_slot_cache * layer_cache_ptr = nullptr;
         int slot = -1;
-        if (!layer_cache.ensure_expert(*packed, backend, slot, error, true)) {
+        std::unique_lock<std::mutex> slot_guard(llama_infinitum_ggml_gpu_slot_cache_mutex(), std::defer_lock);
+        if (!acquire_slot_cache(slot_guard)) {
+            return true;
+        }
+        layer_cache_ptr = &llama_infinitum_ggml_gpu_layer_slot_cache_manager_get().get_layer(layer_index);
+        if (!layer_cache_ptr->begin_upload_expert(*packed, slot, error, true, true, true)) {
             return false;
+        }
+        slot_guard.unlock();
+        if (slot >= 0) {
+            bool upload_ok = layer_cache_ptr->upload_reserved_expert(*packed, upload_backend, slot, error);
+            ggml_backend_synchronize(upload_backend);
+            {
+                std::lock_guard<std::mutex> finish_guard(llama_infinitum_ggml_gpu_slot_cache_mutex());
+                layer_cache_ptr->finish_upload_expert(*packed, slot, true, upload_ok);
+            }
+            llama_infinitum_ggml_gpu_slot_cache_cv().notify_all();
+            if (!upload_ok) {
+                return false;
+            }
         }
     }
     return true;
@@ -7160,6 +7510,8 @@ static bool llama_infinitum_ggml_gpu_compute_selected_experts_id(
         float * output,
         std::string & error,
         double * expert_upload_ms = nullptr,
+        double * gpu_compute_wait_ms = nullptr,
+        double * gpu_slot_wait_ms = nullptr,
         double * graph_input_ms = nullptr,
         double * graph_compute_ms = nullptr,
         double * graph_output_ms = nullptr,
@@ -7182,65 +7534,111 @@ static bool llama_infinitum_ggml_gpu_compute_selected_experts_id(
     std::vector<std::int32_t> local_ids(expert_count);
     std::vector<float> local_weights(expert_count);
 
-    std::lock_guard<std::mutex> compute_guard(state.compute_mutex());
-    llama_infinitum_ggml_gpu_layer_slot_cache & layer_cache =
-        llama_infinitum_ggml_gpu_layer_slot_cache_manager_get().get_layer(experts[0]->layer_index);
-    if (!layer_cache.init(
+    state.begin_foreground_wait();
+    const auto compute_wait_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> compute_guard(state.compute_mutex());
+    const auto compute_wait_end = std::chrono::steady_clock::now();
+    state.end_foreground_wait();
+    if (gpu_compute_wait_ms != nullptr) {
+        *gpu_compute_wait_ms = llama_infinitum_elapsed_ms(compute_wait_start, compute_wait_end);
+    }
+
+    llama_infinitum_ggml_gpu_layer_slot_cache * layer_cache = nullptr;
+    llama_infinitum_ggml_gpu_layer_compute_graph * graph = nullptr;
+    auto upload_start = std::chrono::steady_clock::now();
+    auto upload_end = upload_start;
+    double slot_wait_total_ms = 0.0;
+
+    {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> slot_guard(llama_infinitum_ggml_gpu_slot_cache_mutex());
+        slot_wait_total_ms += llama_infinitum_elapsed_ms(slot_wait_start, std::chrono::steady_clock::now());
+        layer_cache = &llama_infinitum_ggml_gpu_layer_slot_cache_manager_get().get_layer(experts[0]->layer_index);
+        if (!layer_cache->init(
+                experts[0]->layer_index,
+                hidden_size,
+                llama_infinitum_moe_gpu_selected_slots_from_env(),
+                llama_infinitum_moe_gpu_global_slots_enabled(),
+                backend,
+                error)) {
+            return false;
+        }
+
+        const std::uint64_t slot_hits_before = layer_cache->hits();
+        const std::uint64_t slot_misses_before = layer_cache->misses();
+        const std::uint64_t slot_evictions_before = layer_cache->evictions();
+
+        upload_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < expert_count; ++i) {
+            const llama_infinitum_ggml_packed_expert_mlp & expert = *experts[i];
+            if (expert.layer_index != experts[0]->layer_index) {
+                error = "selected experts span multiple layers";
+                return false;
+            }
+            int slot = -1;
+            for (;;) {
+                if (!layer_cache->ensure_expert(expert, backend, slot, error, false)) {
+                    return false;
+                }
+                if (slot >= 0) {
+                    break;
+                }
+                if (slot == -2 || layer_cache->has_uploading_slots()) {
+                    const auto slot_wait_start = std::chrono::steady_clock::now();
+                    llama_infinitum_ggml_gpu_slot_cache_cv().wait(slot_guard);
+                    slot_wait_total_ms += llama_infinitum_elapsed_ms(slot_wait_start, std::chrono::steady_clock::now());
+                    continue;
+                }
+                error = "no available GPU expert slot for foreground compute";
+                return false;
+            }
+            local_ids[i] = slot;
+            local_weights[i] = i < static_cast<int>(expert_weights.size()) ? expert_weights[i] : (1.0f / float(expert_count));
+        }
+        upload_end = std::chrono::steady_clock::now();
+        if (expert_upload_ms != nullptr) {
+            *expert_upload_ms = llama_infinitum_elapsed_ms(upload_start, upload_end);
+        }
+        if (gpu_slot_hits_delta != nullptr) {
+            *gpu_slot_hits_delta = layer_cache->hits() - slot_hits_before;
+        }
+        if (gpu_slot_misses_delta != nullptr) {
+            *gpu_slot_misses_delta = layer_cache->misses() - slot_misses_before;
+        }
+        if (gpu_slot_evictions_delta != nullptr) {
+            *gpu_slot_evictions_delta = layer_cache->evictions() - slot_evictions_before;
+        }
+
+        const bool q8_input = llama_infinitum_moe_vulkan_q8_input_enabled();
+        const bool f16_input = llama_infinitum_moe_vulkan_f16_input_enabled();
+        static llama_infinitum_ggml_gpu_layer_compute_graph_manager graph_manager;
+        graph = &graph_manager.get_or_create(
+            *layer_cache,
             experts[0]->layer_index,
             hidden_size,
-            llama_infinitum_moe_gpu_selected_slots_from_env(),
-            llama_infinitum_moe_gpu_global_slots_enabled(),
+            expert_count,
+            q8_input,
+            f16_input,
             backend,
-            error)) {
-        return false;
-    }
-    const std::uint64_t slot_hits_before = layer_cache.hits();
-    const std::uint64_t slot_misses_before = layer_cache.misses();
-    const std::uint64_t slot_evictions_before = layer_cache.evictions();
-
-    const auto upload_start = std::chrono::steady_clock::now();
-    for (int i = 0; i < expert_count; ++i) {
-        const llama_infinitum_ggml_packed_expert_mlp & expert = *experts[i];
-        if (expert.layer_index != experts[0]->layer_index) {
-            error = "selected experts span multiple layers";
-            return false;
-        }
-        int slot = -1;
-        if (!layer_cache.ensure_expert(expert, backend, slot, error, false)) {
-            return false;
-        }
-        local_ids[i] = slot;
-        local_weights[i] = i < static_cast<int>(expert_weights.size()) ? expert_weights[i] : (1.0f / float(expert_count));
-    }
-    const auto upload_end = std::chrono::steady_clock::now();
-    if (expert_upload_ms != nullptr) {
-        *expert_upload_ms = llama_infinitum_elapsed_ms(upload_start, upload_end);
-    }
-    if (gpu_slot_hits_delta != nullptr) {
-        *gpu_slot_hits_delta = layer_cache.hits() - slot_hits_before;
-    }
-    if (gpu_slot_misses_delta != nullptr) {
-        *gpu_slot_misses_delta = layer_cache.misses() - slot_misses_before;
-    }
-    if (gpu_slot_evictions_delta != nullptr) {
-        *gpu_slot_evictions_delta = layer_cache.evictions() - slot_evictions_before;
+            device,
+            error);
+        layer_cache->pin_slots(local_ids);
     }
 
-    const bool q8_input = llama_infinitum_moe_vulkan_q8_input_enabled();
-    const bool f16_input = llama_infinitum_moe_vulkan_f16_input_enabled();
-    static llama_infinitum_ggml_gpu_layer_compute_graph_manager graph_manager;
-    llama_infinitum_ggml_gpu_layer_compute_graph & graph = graph_manager.get_or_create(
-        layer_cache,
-        experts[0]->layer_index,
-        hidden_size,
-        expert_count,
-        q8_input,
-        f16_input,
-        backend,
-        device,
-        error);
-    return graph.compute(hidden_data, local_ids.data(), local_weights.data(), backend, output, error,
+    const bool ok = graph != nullptr && graph->compute(hidden_data, local_ids.data(), local_weights.data(), backend, output, error,
             graph_input_ms, graph_compute_ms, graph_output_ms);
+    {
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> slot_guard(llama_infinitum_ggml_gpu_slot_cache_mutex());
+        slot_wait_total_ms += llama_infinitum_elapsed_ms(slot_wait_start, std::chrono::steady_clock::now());
+        if (layer_cache != nullptr) {
+            layer_cache->unpin_slots(local_ids);
+        }
+    }
+    if (gpu_slot_wait_ms != nullptr) {
+        *gpu_slot_wait_ms = slot_wait_total_ms;
+    }
+    return ok;
 }
 
 static llama_infinitum_moe_expert_mlp_result llama_infinitum_moe_execute_selected_experts_vulkan_ptr(
@@ -7334,6 +7732,8 @@ static llama_infinitum_moe_expert_mlp_result llama_infinitum_moe_execute_selecte
     const auto compute_start = std::chrono::steady_clock::now();
     bool all_finite = true;
     double expert_upload_ms = 0.0;
+    double gpu_compute_wait_ms = 0.0;
+    double gpu_slot_wait_ms = 0.0;
     double graph_input_ms = 0.0;
     double graph_compute_ms = 0.0;
     double graph_output_ms = 0.0;
@@ -7342,7 +7742,7 @@ static llama_infinitum_moe_expert_mlp_result llama_infinitum_moe_execute_selecte
     std::uint64_t gpu_slot_evictions_delta = 0;
     if (!llama_infinitum_ggml_gpu_compute_selected_experts_id(
             packed_experts, expert_weights, hidden_data, hidden_size, expert_output, error,
-            &expert_upload_ms, &graph_input_ms, &graph_compute_ms, &graph_output_ms,
+            &expert_upload_ms, &gpu_compute_wait_ms, &gpu_slot_wait_ms, &graph_input_ms, &graph_compute_ms, &graph_output_ms,
             &gpu_slot_hits_delta, &gpu_slot_misses_delta, &gpu_slot_evictions_delta)) {
         if (!llama_infinitum_ggml_gpu_compute_selected_experts_batched(
                 packed_experts, expert_weights, hidden_data, hidden_size, expert_output, error)) {
@@ -7356,6 +7756,8 @@ static llama_infinitum_moe_expert_mlp_result llama_infinitum_moe_execute_selecte
     const auto compute_end = std::chrono::steady_clock::now();
     result.total_compute_ms = llama_infinitum_elapsed_ms(compute_start, compute_end);
     result.expert_upload_ms = expert_upload_ms;
+    result.gpu_compute_wait_ms = gpu_compute_wait_ms;
+    result.gpu_slot_wait_ms = gpu_slot_wait_ms;
     result.graph_input_ms = graph_input_ms;
     result.graph_compute_ms = graph_compute_ms;
     result.graph_output_ms = graph_output_ms;
@@ -7637,8 +8039,7 @@ llama_infinitum_moe_expert_mlp_result llama_infinitum_moe_execute_selected_exper
         float * output,
         int expert_workers) {
     const llama_infinitum_moe_backend_kind backend = llama_infinitum_moe_backend_kind_from_env();
-    if (backend == llama_infinitum_moe_backend_kind::vulkan ||
-            backend == llama_infinitum_moe_backend_kind::fused_arena) {
+    if (llama_infinitum_moe_backend_uses_gpu_slots(backend)) {
         llama_infinitum_moe_expert_mlp_result gpu_result =
             backend == llama_infinitum_moe_backend_kind::fused_arena ?
                 llama_infinitum_moe_execute_selected_experts_fused_arena_ptr(

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -1541,15 +1542,227 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static bool ggml_backend_sched_moe_copy_cache_enabled() {
     const char * value = getenv("GGML_SCHED_MOE_COPY_CACHE");
+    if (value != NULL && value[0] != '\0') {
+        return value[0] != '0';
+    }
+    const char * disabled = getenv("GGML_SCHED_MOE_COPY_CACHE_DISABLE");
+    if (disabled != NULL && disabled[0] != '\0' && disabled[0] != '0') {
+        return false;
+    }
+    const char * infinitum_pack = getenv("LLAMA_INFINITUM_V2_GGML_EXPERT_PACK");
+    if (infinitum_pack != NULL && infinitum_pack[0] != '\0' && infinitum_pack[0] != '0') {
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_backend_sched_moe_copy_cache_report_enabled() {
+    const char * value = getenv("GGML_SCHED_MOE_COPY_CACHE_REPORT");
+    if (value != NULL && value[0] != '\0') {
+        return value[0] != '0';
+    }
+    value = getenv("LLAMA_INFINITUM_PACK_REPORT");
     return value != NULL && value[0] != '\0' && value[0] != '0';
 }
 
+static bool ggml_backend_sched_moe_copy_trace_enabled() {
+    const char * value = getenv("GGML_SCHED_MOE_COPY_TRACE");
+    return value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
+static uint64_t ggml_backend_sched_moe_copy_trace_limit() {
+    const char * value = getenv("GGML_SCHED_MOE_COPY_TRACE_LIMIT");
+    if (value == NULL || value[0] == '\0') {
+        return 4096;
+    }
+    char * end = nullptr;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value) {
+        return 4096;
+    }
+    return parsed;
+}
+
+static uint64_t ggml_backend_sched_moe_copy_cache_report_interval() {
+    const char * value = getenv("GGML_SCHED_MOE_COPY_CACHE_REPORT_INTERVAL");
+    if (value == NULL || value[0] == '\0') {
+        return 512;
+    }
+    char * end = nullptr;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || parsed == 0) {
+        return 512;
+    }
+    return parsed;
+}
+
+static void ggml_backend_sched_moe_copy_cache_report(
+        const char * tensor_name,
+        int64_t n_expert,
+        uint64_t used_experts,
+        uint64_t resident_hits,
+        uint64_t copied_experts,
+        uint64_t copied_bytes,
+        int64_t id_wait_us) {
+    if (!ggml_backend_sched_moe_copy_cache_report_enabled()) {
+        return;
+    }
+    struct stats_t {
+        uint64_t calls = 0;
+        uint64_t used_experts = 0;
+        uint64_t resident_hits = 0;
+        uint64_t copied_experts = 0;
+        uint64_t copied_bytes = 0;
+        int64_t  id_wait_us = 0;
+        ~stats_t() {
+            if (calls == 0 || !ggml_backend_sched_moe_copy_cache_report_enabled()) {
+                return;
+            }
+            const double resident_hit_rate = used_experts == 0 ? 0.0 :
+                100.0 * double(resident_hits) / double(used_experts);
+            fprintf(stderr,
+                    "ggml_moe_copy_cache_report_final: calls=%llu used=%llu resident_hits=%llu copied=%llu copied_mb=%.1f id_wait_us=%lld resident_hit_rate=%.2f\n",
+                    (unsigned long long) calls,
+                    (unsigned long long) used_experts,
+                    (unsigned long long) resident_hits,
+                    (unsigned long long) copied_experts,
+                    double(copied_bytes) / (1024.0 * 1024.0),
+                    (long long) id_wait_us,
+                    resident_hit_rate);
+        }
+    };
+    static stats_t stats;
+    stats.calls++;
+    stats.used_experts += used_experts;
+    stats.resident_hits += resident_hits;
+    stats.copied_experts += copied_experts;
+    stats.copied_bytes += copied_bytes;
+    stats.id_wait_us += id_wait_us;
+
+    const uint64_t interval = ggml_backend_sched_moe_copy_cache_report_interval();
+    if (stats.calls != 1 && stats.calls % interval != 0) {
+        return;
+    }
+    const double resident_hit_rate = stats.used_experts == 0 ? 0.0 :
+        100.0 * double(stats.resident_hits) / double(stats.used_experts);
+    fprintf(stderr,
+            "ggml_moe_copy_cache_report: calls=%llu tensor=%s n_expert=%lld used=%llu resident_hits=%llu copied=%llu copied_mb=%.1f id_wait_us=%lld resident_hit_rate=%.2f\n",
+            (unsigned long long) stats.calls,
+            tensor_name != NULL && tensor_name[0] != '\0' ? tensor_name : "(unnamed)",
+            (long long) n_expert,
+            (unsigned long long) stats.used_experts,
+            (unsigned long long) stats.resident_hits,
+            (unsigned long long) stats.copied_experts,
+            double(stats.copied_bytes) / (1024.0 * 1024.0),
+            (long long) stats.id_wait_us,
+            resident_hit_rate);
+}
+
+static void ggml_backend_sched_moe_copy_trace(
+        const char * reason,
+        int split_id,
+        int input_id,
+        const struct ggml_backend_sched_split * split,
+        const ggml_tensor * input,
+        const ggml_tensor * input_cpy,
+        const ggml_tensor * consumer) {
+    if (!ggml_backend_sched_moe_copy_trace_enabled()) {
+        return;
+    }
+
+    static uint64_t line_count = 0;
+    const uint64_t limit = ggml_backend_sched_moe_copy_trace_limit();
+    if (limit != 0 && line_count >= limit) {
+        if (line_count == limit) {
+            fprintf(stderr, "ggml_moe_copy_trace: suppressed_after=%llu\n",
+                    (unsigned long long) limit);
+            line_count++;
+        }
+        return;
+    }
+    line_count++;
+
+    int mul_mat_id_count = 0;
+    const char * first_mul_mat_id_name = "";
+    const char * first_mul_mat_id_src0_name = "";
+    for (int node_idx = 0; node_idx < split->graph.n_nodes; ++node_idx) {
+        const ggml_tensor * node = split->graph.nodes[node_idx];
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        if (mul_mat_id_count == 0) {
+            first_mul_mat_id_name = node->name;
+            first_mul_mat_id_src0_name = node->src[0] != nullptr ? node->src[0]->name : "";
+        }
+        mul_mat_id_count++;
+    }
+
+    const bool has_buffer = input != nullptr && input->buffer != nullptr;
+    const bool is_weight = has_buffer &&
+        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    const bool is_host = has_buffer && ggml_backend_buffer_is_host(input->buffer);
+    const char * buffer_name = has_buffer ? ggml_backend_buffer_name(input->buffer) : "(none)";
+    const char * input_name = input != nullptr && input->name[0] != '\0' ? input->name : "(unnamed)";
+    const char * copy_name = input_cpy != nullptr && input_cpy->name[0] != '\0' ? input_cpy->name : "(unnamed)";
+    const char * consumer_name = consumer != nullptr && consumer->name[0] != '\0' ? consumer->name : "";
+
+    fprintf(stderr,
+            "ggml_moe_copy_trace: reason=%s split=%d input=%d split_nodes=%d split_inputs=%d "
+            "name=%s copy=%s buffer=%s is_weight=%d is_host=%d bytes=%zu consumer=%s "
+            "mul_mat_id_count=%d first_mul_mat_id=%s first_mul_mat_id_src0=%s\n",
+            reason,
+            split_id,
+            input_id,
+            split->graph.n_nodes,
+            split->n_inputs,
+            input_name,
+            copy_name,
+            buffer_name,
+            is_weight ? 1 : 0,
+            is_host ? 1 : 0,
+            input != nullptr ? ggml_nbytes(input) : size_t(0),
+            consumer_name,
+            mul_mat_id_count,
+            first_mul_mat_id_name != nullptr ? first_mul_mat_id_name : "",
+            first_mul_mat_id_src0_name != nullptr ? first_mul_mat_id_src0_name : "");
+}
+
+static ggml_tensor * ggml_backend_sched_find_moe_weight_consumer(
+        const struct ggml_backend_sched_split * split,
+        const ggml_tensor * input_cpy) {
+    for (int node_idx = 0; node_idx < split->graph.n_nodes; ++node_idx) {
+        ggml_tensor * node = split->graph.nodes[node_idx];
+        if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
 struct ggml_backend_sched_moe_copy_cache_entry {
-    const ggml_tensor * source = nullptr;
+    const void * source_data = nullptr;
     ggml_backend_buffer_t dst_buffer = nullptr;
+    void * dst_data = nullptr;
     int64_t n_expert = 0;
     size_t expert_size = 0;
     std::vector<ggml_bitset_t> resident_ids;
+};
+
+struct ggml_backend_sched_moe_copy_cache_key {
+    ggml_backend_buffer_t dst_buffer = nullptr;
+    void * dst_data = nullptr;
+
+    bool operator==(const ggml_backend_sched_moe_copy_cache_key & other) const {
+        return dst_buffer == other.dst_buffer && dst_data == other.dst_data;
+    }
+};
+
+struct ggml_backend_sched_moe_copy_cache_key_hash {
+    size_t operator()(const ggml_backend_sched_moe_copy_cache_key & key) const {
+        const size_t h0 = std::hash<void *>()(reinterpret_cast<void *>(key.dst_buffer));
+        const size_t h1 = std::hash<void *>()(key.dst_data);
+        return h0 ^ (h1 + 0x9e3779b97f4a7c15ull + (h0 << 6) + (h0 >> 2));
+    }
 };
 
 static ggml_backend_sched_moe_copy_cache_entry & ggml_backend_sched_moe_copy_cache_get(
@@ -1557,14 +1770,20 @@ static ggml_backend_sched_moe_copy_cache_entry & ggml_backend_sched_moe_copy_cac
         ggml_tensor * input_cpy,
         int64_t n_expert,
         size_t expert_size) {
-    static std::unordered_map<ggml_tensor *, ggml_backend_sched_moe_copy_cache_entry> cache;
-    ggml_backend_sched_moe_copy_cache_entry & entry = cache[input_cpy];
-    if (entry.source != input ||
+    static std::unordered_map<
+        ggml_backend_sched_moe_copy_cache_key,
+        ggml_backend_sched_moe_copy_cache_entry,
+        ggml_backend_sched_moe_copy_cache_key_hash> cache;
+    const ggml_backend_sched_moe_copy_cache_key key{input_cpy->buffer, input_cpy->data};
+    ggml_backend_sched_moe_copy_cache_entry & entry = cache[key];
+    if (entry.source_data != input->data ||
             entry.dst_buffer != input_cpy->buffer ||
+            entry.dst_data != input_cpy->data ||
             entry.n_expert != n_expert ||
             entry.expert_size != expert_size) {
-        entry.source = input;
+        entry.source_data = input->data;
         entry.dst_buffer = input_cpy->buffer;
+        entry.dst_data = input_cpy->data;
         entry.n_expert = n_expert;
         entry.expert_size = expert_size;
         entry.resident_ids.clear();
@@ -1609,16 +1828,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
+                ggml_tensor * node = ggml_backend_sched_find_moe_weight_consumer(split, input_cpy);
+                const bool is_weight_input = input->buffer != nullptr &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                const bool is_host_input = input->buffer != nullptr && ggml_backend_buffer_is_host(input->buffer);
+                const char * trace_reason = "selective_copy";
+                if (split->graph.n_nodes <= 0) {
+                    trace_reason = "empty_split";
+                } else if (input->buffer == nullptr) {
+                    trace_reason = "no_buffer";
+                } else if (!is_weight_input) {
+                    trace_reason = "buffer_not_weights";
+                } else if (!is_host_input) {
+                    trace_reason = "not_host_buffer";
+                } else if (node == nullptr) {
+                    trace_reason = "consumer_missing";
+                }
+                ggml_backend_sched_moe_copy_trace(
+                        trace_reason, split_id, input_id, split, input, input_cpy, node);
+
                 if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    is_weight_input &&
+                    is_host_input && (
+                    (node != nullptr)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+                    int64_t id_wait_us = 0;
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1637,9 +1875,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        const int64_t id_wait_start_us = ggml_time_us();
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        id_wait_us = ggml_time_us() - id_wait_start_us;
 
                         // find the used experts
                         used_ids.clear();
@@ -1661,6 +1901,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_sched_moe_copy_cache_get(input, input_cpy, n_expert, expert_size);
                         resident_ids = cache_entry.resident_ids.data();
                     }
+                    uint64_t used_expert_count = 0;
+                    uint64_t resident_hit_count = 0;
+                    uint64_t copied_expert_count = 0;
+                    uint64_t copied_bytes = 0;
+                    for (int64_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+                        if (!ggml_bitset_get(used_ids.data(), expert_id)) {
+                            continue;
+                        }
+                        used_expert_count++;
+                        if (resident_ids != nullptr && ggml_bitset_get(resident_ids, expert_id)) {
+                            resident_hit_count++;
+                        }
+                    }
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1668,6 +1921,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        copied_expert_count += uint64_t(last_id - first_id + 1);
+                        copied_bytes += expert_size_copy + padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1691,6 +1946,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
                     if (id >= n_expert) {
+                        ggml_backend_sched_moe_copy_cache_report(
+                            input->name,
+                            n_expert,
+                            used_expert_count,
+                            resident_hit_count,
+                            copied_expert_count,
+                            copied_bytes,
+                            id_wait_us);
                         continue;
                     }
                     int32_t first_id = id;
@@ -1713,6 +1976,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    ggml_backend_sched_moe_copy_cache_report(
+                        input->name,
+                        n_expert,
+                        used_expert_count,
+                        resident_hit_count,
+                        copied_expert_count,
+                        copied_bytes,
+                        id_wait_us);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface

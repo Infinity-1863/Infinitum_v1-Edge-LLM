@@ -33,6 +33,21 @@ static bool llama_openai_moe_infinitum_ggml_pack_prefetch_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool llama_openai_moe_infinitum_gpu_global_slots_enabled() {
+    const char * value = std::getenv("LLAMA_INFINITUM_EXPERT_GPU_GLOBAL_SLOTS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool llama_openai_moe_infinitum_gpu_slot_backend_enabled() {
+    const char * value = std::getenv("LLAMA_INFINITUM_EXPERT_BACKEND");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(value, "vulkan") == 0 ||
+        std::strcmp(value, "fused_arena") == 0 ||
+        std::strcmp(value, "sycl_arena") == 0;
+}
+
 static int llama_openai_moe_infinitum_ggml_pack_prefetch_max_experts() {
     const char * value = std::getenv("LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS");
     if (value == nullptr || value[0] == '\0') {
@@ -64,6 +79,7 @@ static std::string llama_openai_moe_int_vector_json(const std::vector<int> & val
 enum class llama_openai_moe_infinitum_predictor_mode {
     recent,
     learned,
+    router_shadow,
     off,
 };
 
@@ -74,6 +90,10 @@ static llama_openai_moe_infinitum_predictor_mode llama_openai_moe_infinitum_expe
     }
     if (std::strcmp(value, "learned") == 0 || std::strcmp(value, "online") == 0) {
         return llama_openai_moe_infinitum_predictor_mode::learned;
+    }
+    if (std::strcmp(value, "router-shadow") == 0 || std::strcmp(value, "router_shadow") == 0 ||
+            std::strcmp(value, "shadow-router") == 0 || std::strcmp(value, "shadow_router") == 0) {
+        return llama_openai_moe_infinitum_predictor_mode::router_shadow;
     }
     if (std::strcmp(value, "off") == 0 || std::strcmp(value, "none") == 0 || std::strcmp(value, "0") == 0) {
         return llama_openai_moe_infinitum_predictor_mode::off;
@@ -302,6 +322,9 @@ static llama_openai_moe_infinitum_prefetch_prediction llama_openai_moe_infinitum
         prediction.predicted_current = state.predicted_by_layer[std::size_t(layer_index)];
         prediction.current_hits = llama_openai_moe_infinitum_intersection_count(
             prediction.predicted_current, current_selected);
+        if (mode == llama_openai_moe_infinitum_predictor_mode::router_shadow) {
+            return prediction;
+        }
         if (layer_index + 1 < static_cast<int>(state.selected_by_layer.size())) {
             if (mode == llama_openai_moe_infinitum_predictor_mode::learned) {
                 prediction.next_1 = llama_openai_moe_infinitum_predict_from_edge_locked(
@@ -344,6 +367,20 @@ static llama_openai_moe_infinitum_prefetch_prediction llama_openai_moe_infinitum
         llama_infinitum_moe_prefetch_selected_experts_async(expert_index, cache, layer_index + 2, prediction.next_2);
     }
     return prediction;
+}
+
+static void llama_openai_moe_infinitum_store_router_shadow_prediction(
+        const llama_infinitum_moe_index_info & expert_index,
+        int layer_index,
+        const std::vector<int> & predicted) {
+    if (!llama_infinitum_moe_prefetch_enabled() || layer_index < 0 || layer_index >= 64 || predicted.empty()) {
+        return;
+    }
+    const int expert_count = llama_openai_moe_infinitum_expert_count_from_index(expert_index);
+    llama_openai_moe_infinitum_learned_predictor_state & state = llama_openai_moe_infinitum_learned_predictor_state_get();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.ensure_expert_count(expert_count);
+    state.predicted_by_layer[std::size_t(layer_index)] = predicted;
 }
 
 static void llama_openai_moe_infinitum_learned_predictor_record(
@@ -590,6 +627,47 @@ static int llama_openai_moe_tensor_i32(const ggml_tensor * tensor, int64_t i0, i
     return *reinterpret_cast<const int32_t *>(ptr);
 }
 
+static void llama_openai_moe_infinitum_shadow_prefetch_op(
+        ggml_tensor * dst,
+        const ggml_tensor * selected_tensor,
+        int ith,
+        int /*nth*/,
+        void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    if (dst->type != GGML_TYPE_I32 || selected_tensor->type != GGML_TYPE_I32) {
+        GGML_ABORT("LLAMA_INFINITUM_ROUTER_SHADOW selected expert tensor must be I32");
+    }
+    std::memcpy(dst->data, selected_tensor->data, ggml_nbytes(selected_tensor));
+    auto * data = static_cast<llama_openai_moe_infinitum_prefetch_userdata *>(userdata);
+    if (data == nullptr || data->expert_index == nullptr || data->cache == nullptr) {
+        GGML_ABORT("LLAMA_INFINITUM_ROUTER_SHADOW custom op missing userdata");
+    }
+
+    std::vector<int> predicted;
+    const int64_t n_expert_used = selected_tensor->ne[0];
+    const int64_t n_tokens = std::max<int64_t>(1, selected_tensor->ne[1]);
+    const int predictor_top_k = llama_openai_moe_infinitum_expert_predictor_top_k();
+    predicted.reserve(std::size_t(predictor_top_k));
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t k = 0; k < n_expert_used && static_cast<int>(predicted.size()) < predictor_top_k; ++k) {
+            llama_openai_moe_infinitum_append_unique(
+                predicted,
+                llama_openai_moe_tensor_i32(dst, k, token),
+                predictor_top_k);
+        }
+        if (!predicted.empty()) {
+            break;
+        }
+    }
+    if (predicted.empty()) {
+        return;
+    }
+    llama_openai_moe_infinitum_store_router_shadow_prediction(*data->expert_index, data->layer_index, predicted);
+    llama_infinitum_moe_prefetch_selected_experts_async(*data->expert_index, *data->cache, data->layer_index, predicted);
+}
+
 static void llama_openai_moe_infinitum_prefetch_selected_op(
         ggml_tensor * dst,
         const ggml_tensor * selected_tensor,
@@ -773,6 +851,7 @@ static void llama_openai_moe_infinitum_external_mlp_op(
                 "\"resident_bytes\":%llu,\"process_resident_bytes\":%llu,"
                 "\"input_ms\":%.3f,\"selection_ms\":%.3f,\"prefetch_submit_ms\":%.3f,"
                 "\"load_ms\":%.3f,\"expert_upload_ms\":%.3f,"
+                "\"gpu_compute_wait_ms\":%.3f,\"gpu_slot_wait_ms\":%.3f,"
                 "\"graph_input_ms\":%.3f,\"graph_compute_ms\":%.3f,\"graph_output_ms\":%.3f,"
                 "\"gate_up_ms\":%.3f,\"activation_ms\":%.3f,\"down_ms\":%.3f,"
                 "\"accumulate_ms\":%.3f,"
@@ -803,6 +882,8 @@ static void llama_openai_moe_infinitum_external_mlp_op(
                 prefetch_submit_ms,
                 result.load_ms,
                 result.expert_upload_ms,
+                result.gpu_compute_wait_ms,
+                result.gpu_slot_wait_ms,
                 result.graph_input_ms,
                 result.graph_compute_ms,
                 result.graph_output_ms,
@@ -1005,8 +1086,16 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
                         const bool use_ggml_pack_slots =
                             llama_infinitum_moe_ggml_pack_slots_enabled() &&
                             (cur->ne[1] == 1 || llama_openai_moe_infinitum_pack_slots_prefill_enabled());
-                        if (cur->ne[1] == 1 && llama_infinitum_moe_ggml_pack_enabled() && !use_ggml_pack_slots &&
-                                llama_openai_moe_infinitum_ggml_pack_prefetch_enabled()) {
+                        const bool router_shadow_gpu_slot_prefetch =
+                            cur->ne[1] == 1 &&
+                            use_ggml_pack_slots &&
+                            !llama_openai_moe_infinitum_gpu_global_slots_enabled() &&
+                            llama_openai_moe_infinitum_gpu_slot_backend_enabled() &&
+                            llama_openai_moe_infinitum_expert_predictor_mode() ==
+                                llama_openai_moe_infinitum_predictor_mode::router_shadow;
+                        if (cur->ne[1] == 1 && llama_infinitum_moe_ggml_pack_enabled() &&
+                                llama_openai_moe_infinitum_ggml_pack_prefetch_enabled() &&
+                                !router_shadow_gpu_slot_prefetch) {
                             const int prefetch_top_k = llama_openai_moe_infinitum_ggml_pack_prefetch_max_experts();
                             const int64_t n_prefetch_expert_used =
                                 std::max<int64_t>(n_expert_used, std::min<int64_t>(n_expert, prefetch_top_k));
@@ -1023,6 +1112,35 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
                             cb(prefetch_ids, "ffn_moe_topk_external_prefetch", il);
                             ggml_build_forward_expand(gf, prefetch_ids);
                         }
+                        if (cur->ne[1] == 1 && llama_infinitum_moe_ggml_pack_enabled() &&
+                                llama_openai_moe_infinitum_ggml_pack_prefetch_enabled() &&
+                                llama_openai_moe_infinitum_expert_predictor_mode() ==
+                                    llama_openai_moe_infinitum_predictor_mode::router_shadow) {
+                            const int predictor_top_k = llama_openai_moe_infinitum_expert_predictor_top_k();
+                            const int predictor_lookahead = llama_openai_moe_infinitum_expert_predictor_lookahead();
+                            const int64_t n_shadow_expert_used =
+                                std::max<int64_t>(n_expert_used, std::min<int64_t>(n_expert, predictor_top_k));
+                            for (int lookahead = 1; lookahead <= predictor_lookahead && il + lookahead < n_layer; ++lookahead) {
+                                ggml_tensor * shadow_logits = build_lora_mm(model.layers[il + lookahead].ffn_gate_inp, cur);
+                                cb(shadow_logits, "ffn_moe_router_shadow_logits", il + lookahead);
+                                if (model.layers[il + lookahead].ffn_gate_inp_b) {
+                                    shadow_logits = ggml_add(ctx0, shadow_logits, model.layers[il + lookahead].ffn_gate_inp_b);
+                                    cb(shadow_logits, "ffn_moe_router_shadow_logits_biased", il + lookahead);
+                                }
+                                ggml_tensor * shadow_experts = ggml_argsort_top_k(ctx0, shadow_logits, n_shadow_expert_used);
+                                cb(shadow_experts, "ffn_moe_router_shadow_topk", il + lookahead);
+                                auto * userdata = llama_openai_moe_infinitum_prefetch_userdata_for_layer(
+                                    expert_index,
+                                    cache,
+                                    static_cast<int>(il + lookahead),
+                                    0,
+                                    static_cast<int>(n_shadow_expert_used));
+                                ggml_tensor * shadow_ids = ggml_map_custom1(ctx0, shadow_experts,
+                                        llama_openai_moe_infinitum_shadow_prefetch_op, 1, userdata);
+                                cb(shadow_ids, "ffn_moe_router_shadow_prefetch", il + lookahead);
+                                ggml_build_forward_expand(gf, shadow_ids);
+                            }
+                        }
 
                         ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, logits, n_expert_used);
                         cb(selected_experts, "ffn_moe_topk_external", il);
@@ -1035,24 +1153,50 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
                         cb(weights, "ffn_moe_weights_external_softmax", il);
 
                         if (llama_infinitum_moe_ggml_pack_enabled() && !use_ggml_pack_slots) {
-                            ggml_tensor * gate_up_exps = llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "gate_up");
+                            const bool use_decode_split_gate_up = cur->ne[1] == 1;
+                            ggml_tensor * gate_exps = use_decode_split_gate_up ?
+                                llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "gate") : nullptr;
+                            ggml_tensor * up_exps = use_decode_split_gate_up ?
+                                llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "up") : nullptr;
+                            ggml_tensor * gate_up_exps = nullptr;
+                            const bool use_split_gate_up = gate_exps != nullptr && up_exps != nullptr;
+                            if (!use_split_gate_up) {
+                                gate_up_exps = llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "gate_up");
+                            }
                             ggml_tensor * down_exps    = llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "down");
                             ggml_tensor * gate_up_b    = llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "gate_up_bias");
                             ggml_tensor * down_b       = llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "down_bias");
-                            if (gate_up_exps == nullptr || down_exps == nullptr || gate_up_b == nullptr || down_b == nullptr) {
+                            if ((!use_split_gate_up && gate_up_exps == nullptr) || down_exps == nullptr || gate_up_b == nullptr || down_b == nullptr) {
                                 GGML_ABORT("LLAMA_INFINITUM_V2_GGML_EXPERT_PACK is enabled but external GGML expert pack tensor creation failed");
                             }
 
                             ggml_build_forward_expand(gf, weights);
                             ggml_tensor * moe_inp = ggml_reshape_3d(ctx0, cur, n_embd, 1, cur->ne[1]);
-                            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, moe_inp, selected_experts);
-                            cb(gate_up, "ffn_moe_gate_up_external_ggml", il);
-                            gate_up = ggml_add_id(ctx0, gate_up, gate_up_b, selected_experts);
-                            cb(gate_up, "ffn_moe_gate_up_external_ggml_biased", il);
+                            ggml_tensor * gate = nullptr;
+                            ggml_tensor * up = nullptr;
+                            if (use_split_gate_up) {
+                                gate = build_lora_mm_id(gate_exps, moe_inp, selected_experts);
+                                cb(gate, "ffn_moe_gate_external_ggml", il);
+                                up = build_lora_mm_id(up_exps, moe_inp, selected_experts);
+                                cb(up, "ffn_moe_up_external_ggml", il);
+                                ggml_tensor * gate_b = ggml_view_2d(ctx0, gate_up_b, gate->ne[0], gate_up_b->ne[1], gate_up_b->nb[1], 0);
+                                cb(gate_b, "ffn_moe_gate_bias_external_ggml", il);
+                                ggml_tensor * up_b = ggml_view_2d(ctx0, gate_up_b, up->ne[0], gate_up_b->ne[1], gate_up_b->nb[1], up->ne[0] * gate_up_b->nb[0]);
+                                cb(up_b, "ffn_moe_up_bias_external_ggml", il);
+                                gate = ggml_add_id(ctx0, gate, gate_b, selected_experts);
+                                cb(gate, "ffn_moe_gate_external_ggml_biased", il);
+                                up = ggml_add_id(ctx0, up, up_b, selected_experts);
+                                cb(up, "ffn_moe_up_external_ggml_biased", il);
+                            } else {
+                                ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, moe_inp, selected_experts);
+                                cb(gate_up, "ffn_moe_gate_up_external_ggml", il);
+                                gate_up = ggml_add_id(ctx0, gate_up, gate_up_b, selected_experts);
+                                cb(gate_up, "ffn_moe_gate_up_external_ggml_biased", il);
 
-                            const int64_t n_ff = gate_up->ne[0] / 2;
-                            ggml_tensor * gate = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-                            ggml_tensor * up = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+                                const int64_t n_ff = gate_up->ne[0] / 2;
+                                gate = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                                up = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+                            }
                             cur = ggml_swiglu_oai(ctx0, gate, up, 1.702f, 7.0f);
                             cb(cur, "ffn_moe_swiglu_external_ggml", il);
 

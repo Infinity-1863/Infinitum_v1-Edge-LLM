@@ -44,6 +44,7 @@ $requiredFiles = @(
   "vendor\llama.cpp\src\models\openai-moe.cpp",
   "scripts\split-model.ps1",
   "scripts\build-expert-pack.ps1",
+  "scripts\build-split-pack.ps1",
   "scripts\build-runtime-pc.ps1",
   "scripts\build-runtime-android.ps1",
   "scripts\bench-pc.ps1",
@@ -52,7 +53,8 @@ $requiredFiles = @(
   "scripts\run-pc.ps1",
   "scripts\run-phone.ps1",
   "scripts\chat.ps1",
-  "tools\build_expert_pack.py"
+  "tools\build_expert_pack.py",
+  "tools\split_ggml_expert_pack.py"
 )
 
 foreach ($file in $requiredFiles) {
@@ -131,18 +133,103 @@ try {
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD = `"1`"" "PC page-prefetch profile should keep the stable L+1 default"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD = `$env:LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD" "PC bench result should record predictor lookahead"
   Assert-Contains $benchSource "LLAMA_INFINITUM_GGML_PACK_PREFETCH_TOUCH_FALLBACK" "PC bench should clear opt-in touch fallback"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK" "PC bench should auto-use split GGML expert packs when present"
+  Assert-Contains $benchSource "expert_split_pack" "PC bench should read split expert packs from the package manifest"
+  Assert-Contains $benchSource '-not $useOneApiRuntime' "PC bench should keep merged expert packs on SYCL when oneAPI can handle them"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_PREDICTOR" "PC bench should keep learned prediction available for streaming diagnostics"
+  Assert-Contains $benchSource "router-shadow" "PC bench should expose the router-shadow predictor profile"
+  Assert-Contains $benchSource "sycl-hybrid" "PC bench should expose a SYCL merged-prefill split-decode profile"
+  Assert-Contains $benchSource "sycl-slots" "PC bench should expose a SYCL persistent slot-cache profile"
+  Assert-Contains $benchSource "sycl-router-slots" "PC bench should expose a SYCL router-shadow slot-cache profile"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-hybrid".*LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK = \$splitPack' "SYCL hybrid profile should force split-pack decode on oneAPI runtimes"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-slots".*LLAMA_INFINITUM_EXPERT_BACKEND = "sycl_arena"' "SYCL slot-cache profile should route decode through the fused SYCL arena"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-slots".*LLAMA_INFINITUM_V2_GGML_EXPERT_PACK_SLOTS_PREFILL = "0"' "SYCL slot-cache profile should keep prompt prefill out of GPU slot admission by default"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-router-slots".*LLAMA_INFINITUM_EXPERT_BACKEND = "sycl_arena"' "SYCL router-shadow slot-cache profile should route decode through the fused SYCL arena"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-router-slots".*LLAMA_INFINITUM_EXPERT_PREDICTOR = "router-shadow"' "SYCL router-shadow slot-cache profile should use future-router prediction"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-router-slots".*LLAMA_INFINITUM_EXPERT_PREDICTOR_TOP_K = "8"' "SYCL router-shadow slot-cache profile should use top-8 future-router candidates"
+  Assert-Matches $benchSource '(?s)Profile -eq "sycl-router-slots".*LLAMA_INFINITUM_EXPERT_PREDICTOR_LOOKAHEAD = "1"' "SYCL router-shadow slot-cache profile should keep the best measured L+1 future-router prefetch"
+  Assert-Matches $benchSource '(?s)LLAMA_INFINITUM_EXPERT_PREDICTOR = "router-shadow".*LLAMA_INFINITUM_EXPERT_PREDICTOR_TOP_K = "6"' "router-shadow profile should use wider top-6 future-router candidates"
   Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_GPU_GLOBAL_SLOTS" "PC bench should support bounded global GPU expert slots"
+  Assert-Matches $benchSource '(?s)Profile -eq "streaming".*LLAMA_INFINITUM_GGML_PACK_PREFETCH = "1"' "PC streaming profile should enable router-driven GGML pack prefetch"
+  Assert-Matches $benchSource '(?s)Profile -eq "streaming".*LLAMA_INFINITUM_GGML_PACK_PREFETCH_MAX_EXPERTS = "4"' "PC streaming profile should prefetch top-4 router candidates"
+  $pcBuildSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\build-runtime-pc.ps1") -Raw
+  Assert-Contains $pcBuildSource '[ValidateSet("auto", "cpu", "vulkan", "sycl")]' "PC runtime build should expose an explicit backend selector"
+  Assert-Contains $pcBuildSource '-DGGML_VULKAN=ON' "PC runtime build should be able to enable Vulkan for Intel Arc"
+  Assert-Contains $pcBuildSource '-DGGML_SYCL=ON' "PC runtime build should document the SYCL path for oneAPI-capable Intel GPUs"
+  Assert-Contains $pcBuildSource 'setvars.bat' "PC SYCL build should activate an installed oneAPI environment"
+  Assert-Contains $pcBuildSource '-DCMAKE_CXX_COMPILER=icx' "PC SYCL build should use the Intel oneAPI compiler on Windows"
+  Assert-Contains $pcBuildSource '-DGGML_SYCL_DEVICE_ARCH=' "PC SYCL build should support AOT device architecture selection"
+  Assert-Contains $pcBuildSource '--verbose 2>nul' "PC SYCL architecture detection should ignore noisy loader stderr"
+  Assert-Contains $pcBuildSource 'artifacts\sycl-temp-build' "PC SYCL build should use a writable local temp directory"
+  Assert-Contains $pcBuildSource 'llama-ls-sycl-device' "PC SYCL build should include the SYCL device inspection tool"
+
+  Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_WORKERS" "PC bench should expose expert worker scheduling"
+  Assert-Contains $benchSource "LLAMA_INFINITUM_EXPERT_ROW_THREADS" "PC bench should expose row-thread scheduling"
+  Assert-Contains $benchSource "ONEAPI_DEVICE_SELECTOR" "PC bench should set the Intel Level Zero SYCL device selector"
+  Assert-Contains $benchSource "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS" "PC bench should set the Level Zero relaxed allocation guard"
+  Assert-Contains $benchSource "FlashAttention" "PC bench should expose flash attention mode for backend graph comparisons"
+  Assert-Contains $benchSource '"--flash-attn", "$FlashAttention"' "PC bench should pass flash attention mode to llama-server"
+
+  $runPcSource = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\run-pc.ps1") -Raw
+  Assert-Contains $runPcSource "LLAMA_INFINITUM_EXPERT_WORKERS" "PC run should expose expert worker scheduling"
+  Assert-Contains $runPcSource "LLAMA_INFINITUM_EXPERT_ROW_THREADS" "PC run should expose row-thread scheduling"
+  Assert-Contains $runPcSource "ONEAPI_DEVICE_SELECTOR" "PC run should support oneAPI SYCL runtime environment"
+  Assert-Contains $runPcSource "FlashAttention" "PC run should expose flash attention mode"
+  Assert-Contains $runPcSource '"--flash-attn", "$FlashAttention"' "PC run should pass flash attention mode to llama-server"
+  Assert-Contains $runPcSource "LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK" "PC run should auto-use split GGML expert packs when present"
+  Assert-Contains $runPcSource "expert_split_pack" "PC run should read split expert packs from the package manifest"
+  Assert-Contains $runPcSource '-not $useOneApiRuntime' "PC run should keep merged expert packs on SYCL when oneAPI can handle them"
 
   $runtimeSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\src\llama-infinitum-moe.cpp") -Raw
   Assert-Contains $runtimeSource "LLAMA_INFINITUM_SELECTIVE_MOE" "bundled runtime should contain external expert support"
   Assert-Contains $runtimeSource "LLAMA_INFINITUM_EXPERT_ROW_THREADS" "bundled runtime should contain full-model row threading knob"
   Assert-Contains $runtimeSource "LLAMA_INFINITUM_PREFETCH_MAX_PENDING" "bundled runtime should expose bounded prefetch queue control"
   Assert-Contains $runtimeSource "infinitum_prefetch_queue" "bundled runtime should report dropped stale prefetch work"
+  Assert-Matches $runtimeSource "llama_infinitum_moe_ggml_pack_slots_enabled\(\) &&\s*!llama_infinitum_moe_gpu_global_slots_enabled\(\) &&\s*llama_infinitum_moe_backend_uses_gpu_slots\(llama_infinitum_moe_backend_kind_from_env\(\)\)(?s:.*?)llama_infinitum_moe_prefetch_selected_gpu_experts(?s:.*?)llama_infinitum_moe_ggml_pack_prefetch_enabled\(\)(?s:.*?)llama_infinitum_moe_prefetch_selected_ggml_pack_pages" "prefetch worker should prefer safe per-layer GPU slots over page prefetch"
+  Assert-Contains $runtimeSource "LLAMA_INFINITUM_PREFETCH_GPU_BLOCKING" "GPU expert prefetch should expose an opt-in blocking mode"
+  Assert-Contains $runtimeSource "llama_infinitum_ggml_gpu_upload_backend" "GPU expert prefetch should use a dedicated upload backend"
+  Assert-Contains $runtimeSource "upload_backend" "GPU expert prefetch should enqueue uploads on a backend separate from foreground compute"
+  Assert-True (-not $runtimeSource.Contains("std::unique_lock<std::mutex> compute_guard(state.compute_mutex(), std::defer_lock)")) "GPU expert prefetch must not take the foreground compute mutex"
+  Assert-True (-not $runtimeSource.Contains("compute_guard.try_lock()")) "GPU expert prefetch must not poll the foreground compute lock"
+  Assert-Contains $runtimeSource "foreground_waiters" "GPU backend should track foreground compute demand"
+  Assert-Contains $runtimeSource "llama_infinitum_moe_backend_uses_gpu_slots" "GPU expert prefetch should share the Vulkan/SYCL slot-cache eligibility check"
+  Assert-Matches $runtimeSource "llama_infinitum_moe_backend_uses_gpu_slots\(llama_infinitum_moe_backend_kind_from_env\(\)\)(?s:.*?)llama_infinitum_moe_prefetch_selected_gpu_experts" "prefetch worker should use GPU slots for both Vulkan and fused SYCL arenas"
+  Assert-Matches $runtimeSource "llama_infinitum_moe_prefetch_selected_gpu_experts(?s:.*?)ggml_backend_synchronize\(upload_backend\);" "GPU expert prefetch should synchronize uploaded slots before they can be reused as hits"
+  Assert-Contains $runtimeSource "LLAMA_INFINITUM_V2_GGML_EXPERT_SPLIT_PACK" "GGML expert pack runtime should expose split gate/up physical layout"
+  Assert-Contains $runtimeSource "llama_infinitum_moe_ggml_split_pack_enabled" "GGML expert pack runtime should detect split-pack mode"
+  Assert-Contains $runtimeSource 'std::strcmp(kind, "gate")' "GGML expert pack runtime should create separate gate tensors"
+  Assert-Contains $runtimeSource 'std::strcmp(kind, "up")' "GGML expert pack runtime should create separate up tensors"
+  $backendSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\ggml\src\ggml-backend.cpp") -Raw
+  Assert-Matches $backendSource "ggml_backend_sched_moe_copy_cache_enabled\(\)(?s:.*?)LLAMA_INFINITUM_V2_GGML_EXPERT_PACK(?s:.*?)return true;" "native GGML MoE scheduler should enable resident expert copy cache automatically for external expert packs"
+  Assert-Contains $backendSource "GGML_SCHED_MOE_COPY_CACHE_DISABLE" "native GGML MoE scheduler cache should keep an explicit opt-out"
+  Assert-Contains $backendSource "ggml_backend_sched_moe_copy_cache_report" "native GGML MoE scheduler should expose copy-cache telemetry"
+  Assert-Contains $backendSource "ggml_moe_copy_cache_report_final" "native GGML MoE scheduler should print a final aggregate copy-cache report"
+  Assert-Contains $backendSource "id_wait_us" "native GGML MoE scheduler telemetry should measure router id readback stalls"
+  Assert-Contains $backendSource "resident_hits" "native GGML MoE scheduler telemetry should measure resident expert hits"
+  Assert-Contains $backendSource "GGML_SCHED_MOE_COPY_TRACE" "native GGML MoE scheduler should expose opt-in split/input tracing"
+  Assert-Contains $backendSource "ggml_backend_sched_moe_copy_trace_enabled" "native GGML MoE scheduler should guard trace output behind a helper"
+  Assert-Contains $backendSource "ggml_moe_copy_trace:" "native GGML MoE scheduler trace should use a stable prefix"
+  Assert-Contains $backendSource "buffer_not_weights" "native GGML MoE scheduler trace should explain non-weight inputs"
+  Assert-Contains $backendSource "not_host_buffer" "native GGML MoE scheduler trace should explain non-host inputs"
+  Assert-Contains $backendSource "consumer_missing" "native GGML MoE scheduler trace should explain missing MoE consumers"
+  Assert-Contains $backendSource "ggml_backend_sched_find_moe_weight_consumer" "native GGML MoE scheduler should find MUL_MAT_ID consumers across the full split graph"
+  Assert-Contains $backendSource "ggml_backend_sched_moe_copy_cache_key" "native GGML MoE scheduler cache should be keyed by stable destination slots"
+  Assert-Contains $backendSource "source_data" "native GGML MoE scheduler cache should survive rebuilt graph tensors for the same mapped weights"
+  Assert-Contains $backendSource "dst_data" "native GGML MoE scheduler cache should detect when a destination slot is reused"
+  Assert-True (-not $backendSource.Contains("ggml_tensor * node = split->graph.nodes[0];")) "native GGML MoE scheduler must not assume the MoE consumer is the first split node"
   $openAiMoeSource = Get-Content -LiteralPath (Join-Path $RepoRoot "vendor\llama.cpp\src\models\openai-moe.cpp") -Raw
   Assert-Matches $openAiMoeSource "llama_openai_moe_infinitum_prefetch_selected_op(?s:.*?)llama_openai_moe_infinitum_prefetch_learned_next_layers(?s:.*?)llama_openai_moe_infinitum_learned_predictor_record" "OpenAI-MoE graph prefetch should feed predictor state from router output"
   Assert-Contains $openAiMoeSource "prefetch_submit_ms" "OpenAI-MoE profile should expose early prefetch submit latency"
   Assert-Contains $openAiMoeSource "prediction_hits" "OpenAI-MoE profile should expose predictor hit count"
+  Assert-Contains $openAiMoeSource "router_shadow" "OpenAI-MoE predictor should implement a router-shadow mode"
+  Assert-Contains $openAiMoeSource "llama_openai_moe_infinitum_shadow_prefetch_op" "OpenAI-MoE should have a dedicated future-router shadow prefetch op"
+  Assert-Contains $openAiMoeSource "build_lora_mm(model.layers[il + lookahead].ffn_gate_inp, cur)" "router-shadow should use real future router weights for lookahead prefetch"
+  Assert-Contains $openAiMoeSource 'llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "gate")' "OpenAI-MoE GGML path should use separate gate tensors when split-pack is present"
+  Assert-Contains $openAiMoeSource 'llama_infinitum_moe_ggml_pack_tensor(ctx0, expert_index, static_cast<int>(il), "up")' "OpenAI-MoE GGML path should use separate up tensors when split-pack is present"
+  Assert-Contains $openAiMoeSource "ffn_moe_gate_external_ggml" "OpenAI-MoE GGML path should name separate gate matmuls"
+  Assert-Contains $openAiMoeSource "ffn_moe_up_external_ggml" "OpenAI-MoE GGML path should name separate up matmuls"
+  Assert-Contains $openAiMoeSource "cur->ne[1] == 1" "OpenAI-MoE GGML path should use split gate/up only for single-token decode"
+  Assert-Matches $openAiMoeSource "cur->ne\[1\] == 1 && llama_infinitum_moe_ggml_pack_enabled\(\) &&\s*llama_openai_moe_infinitum_ggml_pack_prefetch_enabled\(\)" "OpenAI-MoE graph prefetch should run for GGML pack slots too"
   Assert-Matches $openAiMoeSource "llama_openai_moe_infinitum_expert_predictor_top_k\(\)\s*\{(?s:.*?)value == nullptr(?s:.*?)return 4;(?s:.*?)parsed <= 0(?s:.*?)return 4;" "OpenAI-MoE predictor top-k fallback should stay at safe top-4 unless explicitly overridden"
   Assert-Matches $openAiMoeSource "llama_openai_moe_infinitum_expert_predictor_lookahead\(\)\s*\{(?s:.*?)value == nullptr(?s:.*?)return 1;(?s:.*?)parsed <= 0(?s:.*?)return 1;" "OpenAI-MoE predictor lookahead fallback should stay at safe L+1 unless explicitly overridden"
   $prefetchIndex = $openAiMoeSource.IndexOf("prefetch_prediction =`r`n            llama_openai_moe_infinitum_prefetch_learned_next_layers")
@@ -151,6 +238,11 @@ try {
   }
   $executeIndex = if ($prefetchIndex -ge 0) { $openAiMoeSource.IndexOf("llama_infinitum_moe_execute_selected_experts_into", $prefetchIndex) } else { -1 }
   Assert-True ($prefetchIndex -ge 0 -and $executeIndex -ge 0 -and $prefetchIndex -lt $executeIndex) "OpenAI-MoE should submit lookahead prefetch before selected expert compute"
+
+  $splitPackToolSource = Get-Content -LiteralPath (Join-Path $RepoRoot "tools\split_ggml_expert_pack.py") -Raw
+  Assert-Contains $splitPackToolSource "experts.split.ggml_mxfp4.bin" "split-pack tool should emit the canonical split pack name"
+  Assert-Contains $splitPackToolSource "expert_split_pack" "split-pack tool should add the split pack to the package manifest"
+  Assert-Contains $splitPackToolSource "gate_up_expert_bytes" "split-pack tool should know the old merged gate_up layout"
 
   $phoneBenchPlan = & (Join-Path $RepoRoot "scripts\bench-phone.ps1") `
     -DeviceDir "/data/local/tmp/infinitum-edge-smoke" `

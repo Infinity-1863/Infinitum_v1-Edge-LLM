@@ -48,6 +48,19 @@ Phone package: `/data/local/tmp/infinitum-edge-gpt-oss-20b`
 | before | graph, 4 threads | 1.4 | 2.35 | `pc-bench-120b-queue/20260604-134409-baseline.result.json` |
 | after | graph predictor-prefetch, 4 threads | 1.41 | 3.16 | `pc-bench-120b-queue/20260604-135330-page-prefetch.result.json` |
 | best | graph, auto threads | 2.82 | 3.24 | `pc-bench-120b-queue/20260604-135530-baseline.result.json` |
+| before | Vulkan baseline, 32 tokens | 2.11 | 3.05 | `pc-bench-router-shadow-120b/20260605-100445-baseline.result.json` |
+| current | router-shadow top-6, 32 tokens | 2.11 | 0.97 | `pc-bench-router-shadow-120b/20260605-100308-router-shadow.result.json` |
+| before | Vulkan baseline, 64 tokens | 2.19 | 1.91 | `pc-bench-vulkan-120b/20260605-105410-baseline.result.json` |
+| after | Vulkan row4, 64 tokens | 2.15 | 3.23 | `pc-bench-vulkan-120b/20260605-110229-baseline.result.json` |
+| after | oneAPI/SYCL row6, 64 tokens | 2.96 | 2.79 | `pc-bench-sycl-120b/20260605-112241-baseline.result.json` |
+| before | Vulkan baseline, 64 tokens | 2.19 | 1.91 | `pc-bench-vulkan-120b/20260605-105410-baseline.result.json`, wall 57.2s |
+| after | oneAPI/SYCL merged, 64 tokens | 2.97 | 2.58 | `pc-bench-sycl-merged-auto-120b/20260605-153852-baseline.result.json`, wall 42.4s |
+| before | oneAPI/SYCL merged, 64 tokens | 3.02 | 2.53 | `pc-bench-sycl-merged-current-120b/20260605-165411-baseline.result.json`, wall 42.3s |
+| after | oneAPI/SYCL merged + flash attention, 64 tokens | 2.91 | 2.86 | `pc-bench-sycl-fa-on-120b/20260605-165902-baseline.result.json`, wall 40.0s |
+| final | oneAPI/SYCL merged + flash attention, 64 tokens | 2.40 | 2.82 | `pc-bench-sycl-fa-on-final-local-120b/20260605-184404-baseline.result.json`, wall 39.0s |
+
+Delta: `57.2s -> 42.4s` wall time (`-25.9%`).
+Delta: `42.3s -> 40.0s` wall time (`-5.4%`), decode `2.53 -> 2.86 tok/s` (`+13.2%`).
 
 ## Phone
 

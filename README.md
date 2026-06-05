@@ -49,10 +49,17 @@ Build the bundled runtime for Android:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-runtime-android.ps1
 ```
 
-Build the bundled runtime for PC:
+Build the bundled runtime for PC. The modified llama.cpp source is included in
+this repository under `vendor/llama.cpp`.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-runtime-pc.ps1
+```
+
+Intel oneAPI/SYCL build:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-runtime-pc.ps1 -Backend sycl
 ```
 
 Preview a PC launch:

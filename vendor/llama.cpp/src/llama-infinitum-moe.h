@@ -77,6 +77,8 @@ struct llama_infinitum_moe_expert_mlp_result {
     std::uint64_t process_resident_bytes = 0;
     double load_ms = 0.0;
     double expert_upload_ms = 0.0;
+    double gpu_compute_wait_ms = 0.0;
+    double gpu_slot_wait_ms = 0.0;
     double graph_input_ms = 0.0;
     double graph_compute_ms = 0.0;
     double graph_output_ms = 0.0;
@@ -128,6 +130,8 @@ bool llama_infinitum_moe_router_probe_enabled();
 bool llama_infinitum_moe_two_phase_bridge_enabled();
 
 bool llama_infinitum_moe_ggml_pack_enabled();
+
+bool llama_infinitum_moe_ggml_split_pack_enabled();
 
 bool llama_infinitum_moe_ggml_pack_slots_enabled();
 
